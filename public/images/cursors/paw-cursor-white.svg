@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+  <!-- Patte de chat blanche -->
+  <!-- Coussinets du haut -->
+  <ellipse cx="8" cy="6" rx="4" ry="5" fill="#ffffff"/>
+  <ellipse cx="16" cy="4" rx="4" ry="4.5" fill="#ffffff"/>
+  <ellipse cx="24" cy="6" rx="4" ry="5" fill="#ffffff"/>
+  <!-- Coussinet principal -->
+  <ellipse cx="16" cy="18" rx="9" ry="10" fill="#ffffff"/>
+  <!-- Petit coussinet du pouce -->
+  <ellipse cx="5" cy="14" rx="3" ry="4" fill="#ffffff"/>
+</svg>
