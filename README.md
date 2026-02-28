@@ -2,6 +2,8 @@
 
 Application web de Planning Poker en temps reel pour les equipes agiles.
 
+**Demo en ligne** : [https://planningpoker.klmcorp.fr](https://planningpoker.klmcorp.fr) 
+
 ## Fonctionnalites principales
 
 - **Rooms en temps reel** avec code unique a 6 caracteres
