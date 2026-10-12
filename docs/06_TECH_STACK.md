@@ -3,13 +3,13 @@
 ## Frontend
 
 ### Framework
-- **Next.js 16.3.8** avec App Router
+- **Next.js 16.4.0** avec App Router
 - **React 19.3.0** avec hooks
 - **TypeScript 7.0.2** pour le typage statique (API TypeScript 6 conservée pour typescript-eslint)
 
 ### Styling
 - **Tailwind CSS 4.3.3** pour le styling utilitaire
-- **PostCSS 8.5.28** pour le traitement CSS
+- **PostCSS 8.5.29** pour le traitement CSS
 - Variables CSS personnalisées pour les couleurs du thème
 
 ### Gestion d'état
@@ -26,17 +26,17 @@
 - **Socket.IO Client 4.8.4** pour les WebSockets
 
 ### Internationalisation
-- **next-intl 4.14.8** pour i18n
+- **next-intl 4.14.9** pour i18n
 - Messages dans `src/i18n/messages/` (en.json, fr.json)
 
 ### Tests
-- **Vitest 5.0.3** avec support coverage
+- **Vitest 5.0.4** avec support coverage
 
 ## Backend
 
 ### Serveur
 - **Node.js 24 LTS** (Alpine Linux)
-- **Express 5.2.1** pour les routes HTTP
+- **Express 5.3.0** pour les routes HTTP
 - **TypeScript** compilé avec `tsc` (TypeScript 7) ; exécuté en dev avec tsx
 - **Socket.IO Server 4.8.4** pour les WebSockets
 
@@ -44,7 +44,7 @@
 - **Helmet 8.3.0** pour les headers de sécurité (CSP)
 - **CORS 2.8.6** configurable
 - **bcrypt 6.0.0** pour le hachage des mots de passe
-- **express-rate-limit 8.7.0** pour le rate limiting
+- **express-rate-limit 8.7.1** pour le rate limiting
 
 ### Stockage
 - **SQLite** avec **better-sqlite3 13.0.3**
@@ -55,7 +55,7 @@
   - Perdues au redémarrage (comportement attendu)
 
 ### Email
-- **Nodemailer 10.0.13** pour l'envoi d'emails
+- **Nodemailer 10.1.0** pour l'envoi d'emails
 - Utilisé pour : reset de mot de passe
 
 ### Upload de fichiers
