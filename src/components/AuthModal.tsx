@@ -115,6 +115,11 @@ export default function AuthModal({ isOpen, onClose, initialMode = 'login' }: Au
           setError(result.error || t('sendEmailError'));
         }
       } else if (mode === 'reset') {
+        if (!email.trim()) {
+          setError(t('emailRequired'));
+          setIsLoading(false);
+          return;
+        }
         if (!resetCode.trim()) {
           setError(t('codeRequired'));
           setIsLoading(false);
@@ -130,7 +135,7 @@ export default function AuthModal({ isOpen, onClose, initialMode = 'login' }: Au
           setIsLoading(false);
           return;
         }
-        const result = await resetPassword(resetCode, password);
+        const result = await resetPassword(email.trim(), resetCode.trim(), password);
         if (result.success) {
           setSuccess(t('resetSuccess'));
           setTimeout(() => {
@@ -305,8 +310,8 @@ export default function AuthModal({ isOpen, onClose, initialMode = 'login' }: Au
             </div>
           )}
 
-          {/* Champ Email pour mot de passe oublié */}
-          {mode === 'forgot' && (
+          {/* Champ Email pour mot de passe oublié et réinitialisation (le serveur lie le code à l'email) */}
+          {(mode === 'forgot' || mode === 'reset') && (
             <div>
               <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
                 {t('email')}

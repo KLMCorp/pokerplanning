@@ -7,6 +7,7 @@
  */
 
 import React, { useMemo } from 'react';
+import { useTranslations } from 'next-intl';
 import { CardConfig } from '@/types';
 import { getCardBackUrl, getCardLogoUrl, isSpecialCard } from '@/lib/cardImages';
 
@@ -22,6 +23,7 @@ interface CardProps {
   disabled?: boolean;
   className?: string;
   noFlip?: boolean;
+  haloType?: 'highest' | 'lowest'; // Halo orange (highest) ou violet (lowest) au reveal
 }
 
 export default React.memo(function Card({
@@ -36,7 +38,10 @@ export default React.memo(function Card({
   disabled = false,
   className = '',
   noFlip = false,
+  haloType,
 }: CardProps) {
+  const t = useTranslations('card');
+
   // Dimensions selon la taille
   const dimensions = useMemo(() => {
     switch (size) {
@@ -57,6 +62,12 @@ export default React.memo(function Card({
 
   // Couleur effective
   const color = cardColor || '#3B82F6';
+
+  const haloStyle = useMemo<React.CSSProperties>(() => {
+    if (!haloType) return {};
+    if (haloType === 'highest') return { boxShadow: '0 0 14px 5px rgba(251, 146, 60, 0.85)' };
+    return { boxShadow: '0 0 14px 5px rgba(167, 139, 250, 0.85)' };
+  }, [haloType]);
 
   // Contenu du recto de la carte
   const renderFront = () => {
@@ -112,7 +123,7 @@ export default React.memo(function Card({
       style={{ backgroundColor: color }}
     >
       {computedBackUrl ? (
-        <img src={computedBackUrl} alt="Dos de carte" className="w-full h-full object-contain" referrerPolicy="no-referrer" />
+        <img src={computedBackUrl} alt={t('backAlt')} className="w-full h-full object-contain" referrerPolicy="no-referrer" />
       ) : (
         <div className="w-full h-full flex items-center justify-center relative">
           <div className="absolute inset-1 border border-white/30 rounded-md" />
@@ -137,6 +148,7 @@ export default React.memo(function Card({
         ${onClick && !disabled ? 'hover:shadow-xl hover:-translate-y-1' : ''}
         ${disabled ? 'opacity-50' : ''}
       `}
+      style={haloStyle}
     >
       {renderFront()}
     </div>

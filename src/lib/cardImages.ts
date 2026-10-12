@@ -59,3 +59,11 @@ export function getCardLogoUrl(value: string): string {
 export function isSpecialCard(value: string): boolean {
   return value === '?' || value === 'coffee';
 }
+
+/**
+ * Dos de carte à afficher : le dos défini pour la room (DeckSettings) prime
+ * sur le dos personnel de l'utilisateur.
+ */
+export function resolveCardBackUrl(roomDeckBackUrl?: string, userBackUrl?: string): string | undefined {
+  return roomDeckBackUrl || userBackUrl || undefined;
+}

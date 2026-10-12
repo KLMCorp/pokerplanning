@@ -1,0 +1,182 @@
+# =============================================================================
+# Release — Build & publish Docker image on version tag
+# =============================================================================
+# Actif uniquement sur un miroir GitHub (le dépôt de référence est OneDev : job Release
+# de .onedev-buildspec.yml). Déclenché par un tag Git au format vX.Y.Z (ex: v1.2.0).
+#
+# Étapes :
+#   1. Lint, typecheck, tests
+#   2. Build multi-arch (linux/amd64 + linux/arm64) et push sur ghcr.io
+#      (+ Docker Hub si la variable de dépôt PUBLISH_DOCKERHUB vaut 'true')
+#   3. Création d'une GitHub Release avec changelog auto-généré
+#
+# Docker Hub (opt-in, éviter la double publication avec OneDev) :
+#   variable PUBLISH_DOCKERHUB=true + secrets DOCKERHUB_USERNAME, DOCKERHUB_TOKEN
+#
+# Images publiées :
+#   ghcr.io/<owner>/<repo>:v1.2.0, :1.2.0, :1.2, :latest
+#   docker.io/klmcorp/pokerplanning:(idem)        (si PUBLISH_DOCKERHUB=true)
+# Une pré-version (v1.2.0-rc1) ne met jamais à jour :latest.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+# Permissions nécessaires pour push GHCR + créer une release
+permissions:
+  contents: write
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  DOCKERHUB_IMAGE: docker.io/klmcorp/pokerplanning
+
+jobs:
+  # ── Étape 1 : Validation ──────────────────────────────────────────────────
+  test:
+    name: Lint, Type check & Test
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 24
+        cache: npm
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Check TypeScript 7
+      run: npx tsc -v | grep -q "Version 7"
+
+    - name: Lint
+      run: npm run lint
+
+    - name: Type check
+      run: npm run typecheck
+
+    - name: Tests
+      run: npm run test:run
+
+  # ── Étape 2 : Build & Push Docker (multi-arch) ────────────────────────────
+  docker:
+    name: Build & Push Docker image
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+    - uses: actions/checkout@v4
+
+    # Extrait la version depuis le tag (v1.2.0 → 1.2.0)
+    - name: Extract version from tag
+      id: version
+      run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+    # Liste des images cibles (Docker Hub seulement si PUBLISH_DOCKERHUB=true)
+    - name: Select image names
+      id: images
+      env:
+        PUBLISH_DOCKERHUB: ${{ vars.PUBLISH_DOCKERHUB }}
+      run: |
+        {
+          echo 'list<<EOF'
+          echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          if [ "$PUBLISH_DOCKERHUB" = "true" ]; then
+            echo "${{ env.DOCKERHUB_IMAGE }}"
+          fi
+          echo 'EOF'
+        } >> "$GITHUB_OUTPUT"
+
+    # Émulation arm64 + builder buildx (multi-plateforme)
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Log in to Docker Hub
+      if: vars.PUBLISH_DOCKERHUB == 'true'
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    - name: Extract Docker metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ steps.images.outputs.list }}
+        tags: |
+          type=ref,event=tag
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        file: ./Dockerfile.local
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        build-args: |
+          APP_VERSION=${{ steps.version.outputs.VERSION }}
+          NEXT_PUBLIC_CARDS_PATH=${{ vars.NEXT_PUBLIC_CARDS_PATH || '/images/cartes' }}
+
+  # ── Étape 3 : GitHub Release ──────────────────────────────────────────────
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: docker
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Extract version from tag
+      id: version
+      run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+    - name: Generate release notes
+      id: notes
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        # Génère le changelog auto depuis le tag précédent
+        BODY=$(gh api repos/${{ github.repository }}/releases/generate-notes \
+          -f tag_name="${{ github.ref_name }}" \
+          --jq '.body')
+        # Combine Docker instructions + changelog
+        {
+          echo "## Docker"
+          echo ""
+          echo "Image multi-arch (linux/amd64, linux/arm64) :"
+          echo ""
+          echo '```bash'
+          echo "docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}"
+          echo '```'
+          echo ""
+          echo "$BODY"
+        } > release_notes.md
+
+    - name: Create GitHub Release
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        gh release create "${{ github.ref_name }}" \
+          --title "v${{ steps.version.outputs.VERSION }}" \
+          --notes-file release_notes.md \
+          ${{ contains(github.ref_name, '-') && '--prerelease' || '' }}

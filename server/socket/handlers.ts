@@ -6,8 +6,14 @@
 import { Server, Socket } from 'socket.io';
 import * as roomStore from '../store/roomStore';
 import * as userStore from '../store/userStore';
-import { sendPasswordResetEmail } from '../utils/mailer';
-import { ClientToServerEvents, ServerToClientEvents, DeckConfig, ItemHistory, BacklogItem, Room, RoomSettings } from '../../src/types';
+import { sendPasswordResetEmail, isMailerConfigured } from '../utils/mailer';
+import { createSafeOn, isPlainObject } from './safeHandler';
+import { getHandshakeIp } from '../utils/clientIp';
+import { getEnvInt } from '../utils/env';
+import { normalizeRoomCode, isValidRoomCode } from '../utils/roomCode';
+import { deleteRoomUploads, deleteUserUploads } from '../utils/uploads';
+import { collectDeckImageUrls, isAllowedDeckImageUrl } from '../utils/deckImages';
+import { ClientToServerEvents, ServerToClientEvents, DeckConfig, BacklogItem, Room, RoomSettings } from '../../src/types';
 import * as fsPromises from 'fs/promises';
 import * as path from 'path';
 
@@ -31,12 +37,19 @@ function cleanupRateLimitMap(): void {
 }
 
 // Nettoyage périodique du rate limit map
-setInterval(cleanupRateLimitMap, RATE_LIMIT_CLEANUP_INTERVAL);
+setInterval(() => {
+  try {
+    cleanupRateLimitMap();
+  } catch (e) {
+    console.error('[rateLimit] cleanup failed', e);
+  }
+}, RATE_LIMIT_CLEANUP_INTERVAL);
 
 /**
  * Vérifie le rate limit pour une clé donnée (socket ID, IP, etc.)
+ * windowMs : durée de la fenêtre (1 minute par défaut) ; chaque entrée garde son propre resetTime
  */
-function checkRateLimit(key: string, maxRequests: number): boolean {
+function checkRateLimit(key: string, maxRequests: number, windowMs: number = RATE_LIMIT_WINDOW): boolean {
   const now = Date.now();
   const entry = rateLimitMap.get(key);
 
@@ -45,7 +58,7 @@ function checkRateLimit(key: string, maxRequests: number): boolean {
     if (rateLimitMap.size >= RATE_LIMIT_MAX_SIZE) {
       cleanupRateLimitMap();
     }
-    rateLimitMap.set(key, { count: 1, resetTime: now + RATE_LIMIT_WINDOW });
+    rateLimitMap.set(key, { count: 1, resetTime: now + windowMs });
     return true;
   }
 
@@ -57,8 +70,12 @@ function checkRateLimit(key: string, maxRequests: number): boolean {
   return true;
 }
 
+// Plafond de codes de reset envoyés par email normalisé et par heure (en plus de 3/min)
+const FORGOT_EMAIL_MAX_PER_HOUR = 5;
+const FORGOT_EMAIL_MAX_PER_DAY = 10; // plafond sur 24 h (limite le total d'essais de code sur un compte ciblé)
+
 // Délai de grâce pour la reconnexion (30 secondes)
-const RECONNECT_GRACE_PERIOD = 30000;
+const DEFAULT_RECONNECT_GRACE_PERIOD = 30000;
 const disconnectTimers: Map<string, NodeJS.Timeout> = new Map();
 
 // Taille max du rate limit map pour éviter les fuites mémoire
@@ -68,14 +85,7 @@ const RATE_LIMIT_MAX_SIZE = 10000;
  * Récupère l'adresse IP réelle du client (support proxy/load balancer)
  */
 function getClientIp(socket: SocketClient): string {
-  if (process.env.TRUST_PROXY === 'true') {
-    const forwarded = socket.handshake.headers['x-forwarded-for'];
-    if (forwarded) {
-      const ip = Array.isArray(forwarded) ? forwarded[0] : forwarded.split(',')[0].trim();
-      return ip;
-    }
-  }
-  return socket.handshake.address;
+  return getHandshakeIp(socket.handshake);
 }
 
 // Configuration des uploads
@@ -104,8 +114,8 @@ const ALLOWED_EMOJIS = new Set(['🍺', '🗞️', '✈️', '💵']);
 function emitRoomUpdate(io: SocketServer, roomId: string, room: Room): void {
   if (room.state === 'voting') {
     const socketUserMap = roomStore.getSocketUserMap(roomId);
-    for (const [socketId, oderId] of socketUserMap) {
-      io.to(socketId).emit('room:updated', roomStore.sanitizeRoomForUser(room, oderId));
+    for (const [socketId, userId] of socketUserMap) {
+      io.to(socketId).emit('room:updated', roomStore.sanitizeRoomForUser(room, userId));
     }
   } else {
     io.to(roomId).emit('room:updated', room);
@@ -120,16 +130,19 @@ function stripControlChars(str: string): string {
 }
 
 /**
- * Sanitize une entrée utilisateur : supprime les caractères de contrôle
- * et échappe les 5 caractères HTML dangereux pour la défense en profondeur contre XSS
+ * Sanitize une entrée utilisateur : supprime les caractères de contrôle (sauf \n et \t).
+ * Aucun échappement HTML n'est appliqué : le rendu React échappe le texte. Ne jamais
+ * injecter ces valeurs via dangerouslySetInnerHTML ni dans du HTML brut (les emails utilisent escapeHtml).
  */
 function sanitizeInput(str: string): string {
-  return stripControlChars(str)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#x27;');
+  return stripControlChars(str);
+}
+
+/**
+ * Attend un délai aléatoire uniforme entre minMs et maxMs
+ */
+function randomDelay(minMs: number, maxMs: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, minMs + Math.random() * (maxMs - minMs)));
 }
 
 /**
@@ -334,44 +347,60 @@ function getDefaultDeck(): DeckConfig {
   };
 }
 
-/**
- * Construit l'historique des items estimés d'une room
- * Utilisé lors de la sauvegarde de l'historique (fermeture, départ, score final, etc.)
- */
-function buildItemHistories(room: Room): ItemHistory[] {
-  return room.items
-    .filter((item) => item.finalScore)
-    .map((item) => ({
-      id: item.id,
-      title: item.title,
-      description: item.description,
-      finalScore: item.finalScore,
-      votes: Object.entries(item.votes).reduce((acc, [oderId, vote]) => {
-        const voter = room.users[oderId];
-        acc[oderId] = {
-          voterName: voter?.name || 'Inconnu',
-          value: vote.value,
-        };
-        return acc;
-      }, {} as Record<string, { voterName: string; value: string }>),
-    }));
-}
-
 type SocketServer = Server<ClientToServerEvents, ServerToClientEvents>;
 type SocketClient = Socket<ClientToServerEvents, ServerToClientEvents>;
+
+/**
+ * Annule un timer de déconnexion en attente (clé = `${roomId}:${userId}`)
+ */
+function clearDisconnectTimer(key: string): void {
+  const timer = disconnectTimers.get(key);
+  if (timer) {
+    clearTimeout(timer);
+    disconnectTimers.delete(key);
+  }
+}
+
+/**
+ * Nombre de timers de déconnexion en attente (tests uniquement)
+ */
+export function _getDisconnectTimerCountForTests(): number {
+  return disconnectTimers.size;
+}
+
+/**
+ * Réagit à la suppression d'une room par le store (PO parti, PO non revenu, room vide, TTL) :
+ * annule les timers, notifie les clients, fait quitter la room socket.io et supprime les uploads.
+ */
+function onRoomRemoved(io: SocketServer, e: roomStore.RoomRemovedEvent): void {
+  for (const uid of e.userIds) {
+    clearDisconnectTimer(`${e.roomId}:${uid}`);
+  }
+  if (e.reason !== 'empty') {
+    io.to(e.roomId).emit('room:closed', { roomId: e.roomId, reason: e.reason === 'expired' ? 'expired' : 'po_left' });
+  }
+  io.in(e.roomId).socketsLeave(e.roomId);
+  void deleteRoomUploads(e.roomId);
+  console.log(`[Room] ${e.roomId} removed (${e.reason})`);
+}
 
 /**
  * Configure tous les handlers Socket.IO
  */
 export function setupSocketHandlers(io: SocketServer): void {
+  // Suppression centralisée des rooms : notification, timers et uploads gérés ici
+  roomStore.setRoomRemovedListener((e) => onRoomRemoved(io, e));
+
   io.on('connection', (socket: SocketClient) => {
+    // Enregistrement sécurisé : payload validé, ack à usage unique, erreurs capturées
+    const on = createSafeOn(socket);
 
     // ====== AUTHENTIFICATION ======
 
     /**
      * Inscription d'un nouvel utilisateur
      */
-    socket.on('auth:register', async (data, callback) => {
+    on('auth:register', async (data, callback) => {
       // Rate limiting strict pour l'authentification (par IP)
       if (!checkRateLimit(getClientIp(socket) + ':auth', RATE_LIMIT_MAX_AUTH)) {
         callback(false, undefined, 'Trop de tentatives, veuillez réessayer dans une minute');
@@ -382,6 +411,14 @@ export function setupSocketHandlers(io: SocketServer): void {
 
       // Gardes de type runtime
       if (!isString(name) || !isString(password)) {
+        callback(false, undefined, 'Données invalides');
+        return;
+      }
+      if (authType !== undefined && authType !== 'email' && authType !== 'pseudo') {
+        callback(false, undefined, 'Données invalides');
+        return;
+      }
+      if (authType === 'pseudo' ? !isString(pseudo) : !isString(email)) {
         callback(false, undefined, 'Données invalides');
         return;
       }
@@ -423,7 +460,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Connexion d'un utilisateur
      */
-    socket.on('auth:login', async (data, callback) => {
+    on('auth:login', async (data, callback) => {
       // Rate limiting strict pour l'authentification (par IP)
       if (!checkRateLimit(getClientIp(socket) + ':auth', RATE_LIMIT_MAX_AUTH)) {
         callback(false, undefined, 'Trop de tentatives, veuillez réessayer dans une minute');
@@ -431,6 +468,20 @@ export function setupSocketHandlers(io: SocketServer): void {
       }
 
       const { email, password, authType, pseudo } = data;
+
+      // Gardes de type runtime
+      if (!isString(password)) {
+        callback(false, undefined, 'Données invalides');
+        return;
+      }
+      if (authType !== undefined && authType !== 'email' && authType !== 'pseudo') {
+        callback(false, undefined, 'Données invalides');
+        return;
+      }
+      if (authType === 'pseudo' ? !isString(pseudo) : !isString(email)) {
+        callback(false, undefined, 'Données invalides');
+        return;
+      }
 
       if (authType === 'pseudo') {
         if (!pseudo || !password) {
@@ -458,24 +509,28 @@ export function setupSocketHandlers(io: SocketServer): void {
      * Reconnexion d'un utilisateur (après refresh de page)
      * Requiert un sessionToken valide pour sécuriser la session
      */
-    socket.on('auth:reconnect', (data, callback) => {
+    on('auth:reconnect', (data, callback) => {
       const { accountId, sessionToken } = data;
 
       if (!accountId || typeof accountId !== 'string') {
-        callback(false);
+        callback(false, undefined, 'invalid_session');
+        return;
+      }
+      if (sessionToken !== undefined && !isString(sessionToken)) {
+        callback(false, undefined, 'invalid_session');
         return;
       }
 
       // Validation basique de l'accountId (format UUID)
       const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
       if (!uuidRegex.test(accountId)) {
-        callback(false);
+        callback(false, undefined, 'invalid_session');
         return;
       }
 
       // Valider le token de session
       if (!sessionToken || !userStore.validateSessionToken(sessionToken, accountId)) {
-        callback(false);
+        callback(false, undefined, 'invalid_session');
         return;
       }
 
@@ -484,7 +539,7 @@ export function setupSocketHandlers(io: SocketServer): void {
         userStore.setSocketAccount(socket.id, account.id);
         callback(true, account);
       } else {
-        callback(false);
+        callback(false, undefined, 'invalid_session');
       }
     });
 
@@ -492,8 +547,8 @@ export function setupSocketHandlers(io: SocketServer): void {
      * Déconnexion d'un utilisateur
      * Révoque le token de session si fourni
      */
-    socket.on('auth:logout', (data) => {
-      if (data?.sessionToken) {
+    on('auth:logout', (data) => {
+      if (isString(data?.sessionToken) && data.sessionToken) {
         userStore.revokeSessionToken(data.sessionToken);
       }
       userStore.clearSocketAccount(socket.id);
@@ -502,7 +557,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Demande de réinitialisation de mot de passe
      */
-    socket.on('auth:forgotPassword', async (data, callback) => {
+    on('auth:forgotPassword', async (data, callback) => {
       // Rate limiting très strict pour éviter le spam et l'énumération (par IP)
       if (!checkRateLimit(getClientIp(socket) + ':forgot', 3)) { // 3 tentatives max par minute
         callback(false, 'Trop de tentatives, veuillez réessayer dans une minute');
@@ -511,66 +566,98 @@ export function setupSocketHandlers(io: SocketServer): void {
 
       const { email } = data;
 
-      if (!email) {
+      if (!isString(email) || !email.trim()) {
         callback(false, 'Email requis');
         return;
       }
 
-      const user = userStore.findUserByEmail(email);
-      if (!user) {
-        // Pour des raisons de sécurité, on ne révèle pas si l'email existe
-        // On simule un délai pour éviter le timing attack
-        await new Promise(resolve => setTimeout(resolve, 500 + Math.random() * 500));
+      // Vérifié avant toute recherche d'utilisateur : la réponse ne dépend pas de l'email
+      if (!isMailerConfigured()) {
+        callback(false, 'Service email non configuré');
+        return;
+      }
+
+      const normalized = email.trim().toLowerCase();
+
+      // Délai uniforme pour tous les chemins suivants (anti timing attack)
+      await randomDelay(300, 600);
+
+      // Réponse identique sans envoi : email invalide, compte pseudo, ou trop de demandes pour cet email
+      if (
+        !userStore.isValidEmail(normalized) ||
+        normalized.startsWith('pseudo:') ||
+        !checkRateLimit('forgot-email:' + normalized, 3) ||
+        !checkRateLimit('forgot-email-hour:' + normalized, FORGOT_EMAIL_MAX_PER_HOUR, 60 * 60 * 1000) ||
+        !checkRateLimit('forgot-email-day:' + normalized, FORGOT_EMAIL_MAX_PER_DAY, 24 * 60 * 60 * 1000)
+      ) {
         callback(true);
         return;
       }
 
-      const token = userStore.createPasswordResetToken(user.id);
-      const result = await sendPasswordResetEmail(email, user.name, token);
+      // Pour des raisons de sécurité, on ne révèle pas si l'email existe
+      const user = userStore.findUserByEmail(normalized);
+      if (!user) {
+        callback(true);
+        return;
+      }
 
-      callback(result.success, result.success ? undefined : 'Erreur lors de l\'envoi de l\'email');
+      // Répondre avant le DELETE+INSERT synchrone : un email connu ne répond pas plus tard qu'un inconnu.
+      // Une erreur éventuelle est capturée et loggée par le wrapper (ack à usage unique).
+      callback(true);
+      const code = userStore.createPasswordResetToken(user.id);
+      // Envoi en arrière-plan : le résultat n'est pas révélé au client. Ne jamais logger le code.
+      void sendPasswordResetEmail(normalized, user.name, code)
+        .then((r) => {
+          if (!r.success) console.error('[reset] email send failed');
+        })
+        .catch((e) => console.error('[reset] email send failed', e));
     });
 
     /**
      * Vérifier un code de réinitialisation
      */
-    socket.on('auth:verifyResetCode', (data, callback) => {
+    on('auth:verifyResetCode', (data, callback) => {
       // Rate limiting pour éviter le bruteforce du code (par IP)
       if (!checkRateLimit(getClientIp(socket) + ':verify', 5)) {
         callback(false, 'Trop de tentatives, veuillez réessayer dans une minute');
         return;
       }
 
-      const { code } = data;
-      const result = userStore.validateResetToken(code);
-      callback(result.valid, result.error);
+      const { email, code } = data;
+      if (!isString(email) || !isString(code)) {
+        callback(false, userStore.RESET_CODE_INVALID_MESSAGE);
+        return;
+      }
+
+      const result = userStore.validateResetToken(email, code);
+      callback(result.valid, result.valid ? undefined : result.error);
     });
 
     /**
      * Réinitialiser le mot de passe
      */
-    socket.on('auth:resetPassword', async (data, callback) => {
+    on('auth:resetPassword', async (data, callback) => {
       // Rate limiting pour éviter le bruteforce du token (par IP)
       if (!checkRateLimit(getClientIp(socket) + ':auth', RATE_LIMIT_MAX_AUTH)) {
         callback(false, 'Trop de tentatives, veuillez réessayer dans une minute');
         return;
       }
 
-      const { code, newPassword } = data;
+      const { email, code, newPassword } = data;
 
-      if (!code || !newPassword) {
-        callback(false, 'Code et nouveau mot de passe requis');
+      if (!isString(email) || !isString(code) || !isString(newPassword) || !email || !code || !newPassword) {
+        callback(false, 'Email, code et nouveau mot de passe requis');
         return;
       }
 
-      const result = await userStore.resetPassword(code, newPassword);
+      const result = await userStore.resetPassword(email, code, newPassword);
       callback(result.success, result.error);
     });
 
     /**
      * Récupérer l'historique des rooms
      */
-    socket.on('auth:getHistory', (callback) => {
+    on('auth:getHistory', (callback) => {
       const accountId = userStore.getSocketAccount(socket.id);
       if (!accountId) {
         callback([]);
@@ -583,9 +670,13 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Supprimer une room de l'historique
      */
-    socket.on('auth:deleteRoomHistory', (data, callback) => {
+    on('auth:deleteRoomHistory', (data, callback) => {
       const accountId = userStore.getSocketAccount(socket.id);
       if (!accountId) {
+        callback(false);
+        return;
+      }
+      if (!isString(data.historyId)) {
         callback(false);
         return;
       }
@@ -596,7 +687,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Mettre à jour la configuration du deck utilisateur
      */
-    socket.on('auth:updateDeck', (data, callback) => {
+    on('auth:updateDeck', (data, callback) => {
       const accountId = userStore.getSocketAccount(socket.id);
       if (!accountId) {
         callback(false);
@@ -614,7 +705,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Upload d'une image pour le deck utilisateur
      */
-    socket.on('auth:uploadDeckImage', async (data, callback) => {
+    on('auth:uploadDeckImage', async (data, callback) => {
       if (!ALLOW_UPLOADS) {
         callback(false, 'Les uploads d\'images sont désactivés');
         return;
@@ -627,6 +718,15 @@ export function setupSocketHandlers(io: SocketServer): void {
       const accountId = userStore.getSocketAccount(socket.id);
       if (!accountId) {
         callback(false, 'Session expirée');
+        return;
+      }
+
+      if (
+        (data.type !== 'front' && data.type !== 'back') ||
+        !isString(data.imageData) ||
+        (data.type === 'front' && !(isString(data.cardValue) && data.cardValue.length > 0))
+      ) {
+        callback(false, 'Données invalides');
         return;
       }
 
@@ -665,9 +765,17 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Supprimer une image du deck utilisateur
      */
-    socket.on('auth:deleteDeckImage', async (data, callback) => {
+    on('auth:deleteDeckImage', async (data, callback) => {
       const accountId = userStore.getSocketAccount(socket.id);
       if (!accountId) {
+        callback(false);
+        return;
+      }
+
+      if (
+        (data.type !== 'front' && data.type !== 'back') ||
+        (data.type === 'front' && !isString(data.cardValue))
+      ) {
         callback(false);
         return;
       }
@@ -716,15 +824,31 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Mettre à jour la configuration de la table utilisateur
      */
-    socket.on('auth:updateTableConfig', (data, callback) => {
+    on('auth:updateTableConfig', (data, callback) => {
       const accountId = userStore.getSocketAccount(socket.id);
       if (!accountId) {
         callback(false);
         return;
       }
 
-      // Valider les couleurs de la table pour prévenir l'injection CSS
+      // Gardes de type runtime
+      const rawConfig: unknown = data.tableConfig;
+      if (rawConfig !== undefined && !isPlainObject(rawConfig)) {
+        callback(false);
+        return;
+      }
+      if (
+        rawConfig &&
+        ((rawConfig.feltColor !== undefined && !isString(rawConfig.feltColor)) ||
+          (rawConfig.borderColor !== undefined && !isString(rawConfig.borderColor)) ||
+          (rawConfig.imageUrl !== undefined && !isString(rawConfig.imageUrl)))
+      ) {
+        callback(false);
+        return;
+      }
       const config = data.tableConfig;
+
+      // Valider les couleurs de la table pour prévenir l'injection CSS
       if (config) {
         const hexColorRegex = /^#([0-9A-Fa-f]{3}|[0-9A-Fa-f]{6}|[0-9A-Fa-f]{8})$/;
         if (config.feltColor && !hexColorRegex.test(config.feltColor)) {
@@ -749,7 +873,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Mettre à jour la configuration du layout de la room
      */
-    socket.on('auth:updateLayoutConfig', (data, callback) => {
+    on('auth:updateLayoutConfig', (data, callback) => {
       const accountId = userStore.getSocketAccount(socket.id);
       if (!accountId) {
         callback(false);
@@ -767,7 +891,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Mettre à jour le TTL des rooms de l'utilisateur
      */
-    socket.on('auth:updateRoomTtl', (data, callback) => {
+    on('auth:updateRoomTtl', (data, callback) => {
       const accountId = userStore.getSocketAccount(socket.id);
       if (!accountId) {
         callback(false, 'Session expirée');
@@ -775,7 +899,7 @@ export function setupSocketHandlers(io: SocketServer): void {
       }
 
       const { ttlMinutes } = data;
-      if (typeof ttlMinutes !== 'number' || ttlMinutes < 1) {
+      if (!Number.isInteger(ttlMinutes) || ttlMinutes < 1) {
         callback(false, 'TTL invalide');
         return;
       }
@@ -787,7 +911,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Upload d'une image pour la table utilisateur
      */
-    socket.on('auth:uploadTableImage', async (data, callback) => {
+    on('auth:uploadTableImage', async (data, callback) => {
       if (!ALLOW_UPLOADS) {
         callback(false, 'Les uploads d\'images sont désactivés');
         return;
@@ -805,6 +929,10 @@ export function setupSocketHandlers(io: SocketServer): void {
 
       try {
         const uploadDir = path.join(process.cwd(), 'public', 'uploads', 'users', accountId);
+        if (!isString(data.imageData)) {
+          callback(false, 'Données invalides');
+          return;
+        }
         const result = await processImageUpload(data.imageData, uploadDir, 'table.img');
         if (!result.success) {
           callback(false, result.error);
@@ -830,7 +958,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Upload d'un avatar utilisateur
      */
-    socket.on('auth:uploadAvatar', async (data, callback) => {
+    on('auth:uploadAvatar', async (data, callback) => {
       if (!ALLOW_UPLOADS) {
         callback(false, 'Les uploads d\'images sont désactivés');
         return;
@@ -848,6 +976,10 @@ export function setupSocketHandlers(io: SocketServer): void {
 
       try {
         const uploadDir = path.join(process.cwd(), 'public', 'uploads', 'users', accountId);
+        if (!isString(data.imageData)) {
+          callback(false, 'Données invalides');
+          return;
+        }
         const result = await processImageUpload(data.imageData, uploadDir, 'avatar.img');
         if (!result.success) {
           callback(false, result.error);
@@ -869,11 +1001,23 @@ export function setupSocketHandlers(io: SocketServer): void {
      * Création d'une nouvelle room
      * L'utilisateur devient automatiquement le PO
      */
-    socket.on('room:create', (data, callback) => {
+    on('room:create', (data, callback) => {
+      // Rate limiting pour éviter la création massive de rooms (par IP)
+      // ROOM_CREATE_RATE_LIMIT_PER_MINUTE=0 : pas de limite (comme MAX_ACTIVE_ROOMS)
+      const roomCreateLimit = getEnvInt('ROOM_CREATE_RATE_LIMIT_PER_MINUTE', 10);
+      if (roomCreateLimit > 0 && !checkRateLimit(getClientIp(socket) + ':roomcreate', roomCreateLimit)) {
+        socket.emit('error', 'Trop de rooms créées, veuillez réessayer dans une minute');
+        return;
+      }
+
       const { userName, password, cardColor } = data;
 
-      // Garde de type runtime
+      // Gardes de type runtime
       if (!isString(userName)) {
+        socket.emit('error', 'Données invalides');
+        return;
+      }
+      if ((password !== undefined && !isString(password)) || (cardColor !== undefined && !isString(cardColor))) {
         socket.emit('error', 'Données invalides');
         return;
       }
@@ -893,6 +1037,18 @@ export function setupSocketHandlers(io: SocketServer): void {
       if (password && password.length > MAX_PASSWORD_LENGTH) {
         socket.emit('error', 'Mot de passe trop long');
         return;
+      }
+
+      // Plafond global de rooms actives (0 = illimité)
+      const maxRooms = getEnvInt('MAX_ACTIVE_ROOMS', 0);
+      if (maxRooms > 0 && roomStore.getAllRooms().length >= maxRooms) {
+        socket.emit('error', 'Nombre maximum de rooms actives atteint, veuillez réessayer plus tard');
+        return;
+      }
+
+      // Le socket est déjà dans une room : la quitter proprement (PO => room fermée pour tous)
+      if (roomStore.getUserInfo(socket.id)) {
+        handleLeaveRoom(socket, io);
       }
 
       // Récupérer le deck et table personnalisés de l'utilisateur si connecté
@@ -930,7 +1086,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Rejoindre une room existante
      */
-    socket.on('room:join', (data, callback) => {
+    on('room:join', (data, callback) => {
       // Rate limiting pour éviter le bruteforce des mots de passe room
       if (!checkRateLimit(getClientIp(socket) + ':roomjoin', 10)) {
         callback(false, undefined, undefined, 'Trop de tentatives, veuillez réessayer dans une minute');
@@ -939,8 +1095,12 @@ export function setupSocketHandlers(io: SocketServer): void {
 
       const { roomId, userName, password, cardColor } = data;
 
-      // Garde de type runtime
-      if (!isString(userName)) {
+      // Gardes de type runtime
+      if (!isString(userName) || !isString(roomId)) {
+        callback(false, undefined, undefined, 'Données invalides');
+        return;
+      }
+      if ((password !== undefined && !isString(password)) || (cardColor !== undefined && !isString(cardColor))) {
         callback(false, undefined, undefined, 'Données invalides');
         return;
       }
@@ -967,6 +1127,30 @@ export function setupSocketHandlers(io: SocketServer): void {
         return;
       }
 
+      // Code normalisé (trim + majuscules) puis validé : aucune valeur brute du client n'est utilisée ensuite
+      const target = normalizeRoomCode(roomId);
+      if (!isValidRoomCode(target)) {
+        callback(false, undefined, undefined, 'Room introuvable');
+        return;
+      }
+
+      const prev = roomStore.getUserInfo(socket.id);
+      if (prev) {
+        const prevRoom = prev.roomId === target ? roomStore.getRoom(target) : undefined;
+        if (prevRoom) {
+          // Déjà dans cette room : idempotent (même userId, même secret, pas de doublon)
+          callback(true, roomStore.sanitizeRoomForUser(prevRoom, prev.userId), prev.userId, undefined, roomStore.getReconnectSecret(target, prev.userId));
+          return;
+        }
+        // La cible doit être joignable AVANT de quitter l'ancienne room (sinon on y reste)
+        const joinable = roomStore.checkJoinable(target, password);
+        if (!joinable.ok) {
+          callback(false, undefined, undefined, joinable.error);
+          return;
+        }
+        handleLeaveRoom(socket, io);
+      }
+
       // Récupérer le dos de carte personnalisé si l'utilisateur est connecté
       const connectedAccountId = userStore.getSocketAccount(socket.id);
       let userCardBackUrl = undefined;
@@ -975,17 +1159,17 @@ export function setupSocketHandlers(io: SocketServer): void {
         userCardBackUrl = customDeck?.backImageUrl;
       }
 
-      const result = roomStore.joinRoom(roomId.toUpperCase().trim(), sanitizeInput(userName.trim()), socket.id, password, userCardBackUrl, cardColor);
+      const result = roomStore.joinRoom(target, sanitizeInput(userName.trim()), socket.id, password, userCardBackUrl, cardColor);
 
       if (!result.success) {
         callback(false, undefined, undefined, result.error);
         return;
       }
 
-      socket.join(roomId.toUpperCase());
+      socket.join(target);
 
       // Notifie les autres utilisateurs (room:updated contient déjà le nouvel utilisateur)
-      emitRoomUpdate(io, roomId.toUpperCase(), result.room!);
+      emitRoomUpdate(io, target, result.room!);
 
       callback(true, roomStore.sanitizeRoomForUser(result.room!, result.userId!), result.userId, undefined, result.reconnectSecret);
     });
@@ -993,7 +1177,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Vérifier si une room existe et si elle a un mot de passe
      */
-    socket.on('room:checkPassword', (data, callback) => {
+    on('room:checkPassword', (data, callback) => {
       // Rate limiting pour éviter l'énumération de rooms
       if (!checkRateLimit(getClientIp(socket) + ':roomcheck', 10)) {
         callback(false, false);
@@ -1001,14 +1185,23 @@ export function setupSocketHandlers(io: SocketServer): void {
       }
 
       const { roomId } = data;
-      const result = roomStore.checkRoomPassword(roomId.toUpperCase().trim());
+      if (!isString(roomId)) {
+        callback(false, false);
+        return;
+      }
+      const target = normalizeRoomCode(roomId);
+      if (!isValidRoomCode(target)) {
+        callback(false, false);
+        return;
+      }
+      const result = roomStore.checkRoomPassword(target);
       callback(result.hasPassword, result.exists);
     });
 
     /**
      * Quitter une room
      */
-    socket.on('room:leave', () => {
+    on('room:leave', () => {
       handleLeaveRoom(socket, io);
     });
 
@@ -1016,20 +1209,35 @@ export function setupSocketHandlers(io: SocketServer): void {
      * Reconnexion à une room après un refresh (F5)
      * Annule le timer de grâce et restaure la session
      */
-    socket.on('room:reconnect', (data, callback) => {
+    on('room:reconnect', (data, callback) => {
       const { roomId, userId, secret } = data;
 
-      if (!roomId || !userId || !secret) {
+      if (!isString(roomId) || !isString(userId) || !isString(secret) || !roomId || !userId || !secret) {
         callback(false);
         return;
       }
 
-      // Annuler le timer de grâce
-      const timerKey = `${roomId}:${userId}`;
-      const timer = disconnectTimers.get(timerKey);
-      if (timer) {
-        clearTimeout(timer);
-        disconnectTimers.delete(timerKey);
+      if (!isValidRoomCode(roomId)) {
+        callback(false);
+        return;
+      }
+
+      // Le socket est déjà associé à une room
+      const prev = roomStore.getUserInfo(socket.id);
+      if (prev) {
+        const prevRoom = prev.roomId === roomId && prev.userId === userId ? roomStore.getRoom(roomId) : undefined;
+        if (prevRoom) {
+          // Même session : rien à restaurer
+          callback(true, roomStore.sanitizeRoomForUser(prevRoom, userId), userId);
+          return;
+        }
+        // Demande invalide (faux secret…) : on ne quitte PAS la room courante
+        if (!roomStore.isValidReconnectRequest(roomId, userId, secret)) {
+          callback(false);
+          return;
+        }
+        // Autre room ou autre utilisateur : quitter l'ancienne room proprement
+        handleLeaveRoom(socket, io);
       }
 
       // Restaurer la session dans roomStore (vérifie le secret)
@@ -1039,6 +1247,9 @@ export function setupSocketHandlers(io: SocketServer): void {
         return;
       }
 
+      // Annuler le timer de grâce UNIQUEMENT si la reconnexion est acceptée (secret vérifié)
+      clearDisconnectTimer(`${roomId}:${userId}`);
+
       socket.join(roomId);
       callback(true, roomStore.sanitizeRoomForUser(room, userId), userId);
     });
@@ -1046,7 +1257,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Fermer une room (PO uniquement) - sauvegarde l'historique
      */
-    socket.on('room:close', (callback) => {
+    on('room:close', (callback) => {
       if (!roomStore.isPO(socket.id)) {
         callback(false);
         return;
@@ -1068,7 +1279,7 @@ export function setupSocketHandlers(io: SocketServer): void {
       const creatorAccountId = roomStore.getRoomCreator(room.id);
       if (creatorAccountId) {
         userStore.updateRoomHistory(creatorAccountId, room.id, {
-          items: buildItemHistories(room),
+          items: roomStore.buildItemHistories(room),
           isActive: false,
           closedAt: Date.now(),
           participantCount: Object.keys(room.users).length,
@@ -1081,7 +1292,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Mettre à jour les paramètres de la room (PO uniquement)
      */
-    socket.on('room:updateSettings', (data, callback) => {
+    on('room:updateSettings', (data, callback) => {
       if (!roomStore.isPO(socket.id)) {
         callback(false);
         return;
@@ -1089,6 +1300,11 @@ export function setupSocketHandlers(io: SocketServer): void {
 
       const userInfo = roomStore.getUserInfo(socket.id);
       if (!userInfo) {
+        callback(false);
+        return;
+      }
+
+      if (!isPlainObject(data.settings)) {
         callback(false);
         return;
       }
@@ -1112,7 +1328,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Transférer le rôle d'organisateur (PO) à un autre utilisateur
      */
-    socket.on('room:transferPO', (data, callback) => {
+    on('room:transferPO', (data, callback) => {
       if (!roomStore.isPO(socket.id)) {
         callback(false, 'Seul le PO peut transférer son rôle');
         return;
@@ -1125,13 +1341,17 @@ export function setupSocketHandlers(io: SocketServer): void {
       }
 
       const { targetUserId } = data;
+      if (!isString(targetUserId)) {
+        callback(false, 'Données invalides');
+        return;
+      }
       const room = roomStore.getRoom(userInfo.roomId);
       if (!room) {
         callback(false, 'Room introuvable');
         return;
       }
 
-      if (!room.users[targetUserId]) {
+      if (!Object.hasOwn(room.users, targetUserId)) {
         callback(false, 'Utilisateur cible introuvable dans la room');
         return;
       }
@@ -1158,7 +1378,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Créer un nouvel item (PO uniquement)
      */
-    socket.on('item:create', (data) => {
+    on('item:create', (data) => {
       if (!checkRateLimit(socket.id, RATE_LIMIT_MAX_GENERAL)) return;
       if (!roomStore.isPO(socket.id)) {
         socket.emit('error', 'Seul le PO peut créer des items');
@@ -1225,7 +1445,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Modifier un item (PO uniquement)
      */
-    socket.on('item:update', (data) => {
+    on('item:update', (data) => {
       if (!checkRateLimit(socket.id, RATE_LIMIT_MAX_GENERAL)) return;
       if (!roomStore.isPO(socket.id)) {
         socket.emit('error', 'Seul le PO peut modifier les items');
@@ -1233,7 +1453,7 @@ export function setupSocketHandlers(io: SocketServer): void {
       }
 
       // Gardes de type runtime
-      if ((data.title !== undefined && !isString(data.title)) || (data.description !== undefined && !isString(data.description))) {
+      if (!isString(data.itemId) || (data.title !== undefined && !isString(data.title)) || (data.description !== undefined && !isString(data.description))) {
         socket.emit('error', 'Données invalides');
         return;
       }
@@ -1283,7 +1503,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Supprimer un item (PO uniquement)
      */
-    socket.on('item:delete', (data) => {
+    on('item:delete', (data) => {
       if (!checkRateLimit(socket.id, RATE_LIMIT_MAX_GENERAL)) return;
       if (!roomStore.isPO(socket.id)) {
         socket.emit('error', 'Seul le PO peut supprimer des items');
@@ -1306,7 +1526,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Réordonner un item (PO uniquement)
      */
-    socket.on('item:reorder', (data) => {
+    on('item:reorder', (data) => {
       if (!checkRateLimit(socket.id, RATE_LIMIT_MAX_GENERAL)) return;
       if (!roomStore.isPO(socket.id)) {
         socket.emit('error', 'Seul le PO peut réordonner les items');
@@ -1333,7 +1553,7 @@ export function setupSocketHandlers(io: SocketServer): void {
      * Sélectionner l'item actif (PO uniquement)
      * Déclenche un reset automatique des votes
      */
-    socket.on('item:select', (data) => {
+    on('item:select', (data) => {
       if (!checkRateLimit(socket.id, RATE_LIMIT_MAX_GENERAL)) return;
       if (!roomStore.isPO(socket.id)) {
         socket.emit('error', 'Seul le PO peut sélectionner un item');
@@ -1357,7 +1577,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Définir le score final d'un item (PO uniquement)
      */
-    socket.on('item:setFinalScore', (data) => {
+    on('item:setFinalScore', (data) => {
       if (!checkRateLimit(socket.id, RATE_LIMIT_MAX_GENERAL)) return;
       if (!roomStore.isPO(socket.id)) {
         socket.emit('error', 'Seul le PO peut définir le score final');
@@ -1385,7 +1605,7 @@ export function setupSocketHandlers(io: SocketServer): void {
           const creatorAccountId = roomStore.getRoomCreator(room.id);
           if (creatorAccountId) {
             userStore.updateRoomHistory(creatorAccountId, room.id, {
-              items: buildItemHistories(room),
+              items: roomStore.buildItemHistories(room),
               participantCount: Object.keys(room.users).length,
             });
           }
@@ -1409,7 +1629,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Démarrer le vote (PO uniquement)
      */
-    socket.on('vote:start', () => {
+    on('vote:start', () => {
       if (!checkRateLimit(socket.id, RATE_LIMIT_MAX_GENERAL)) return;
       if (!roomStore.isPO(socket.id)) {
         socket.emit('error', 'Seul le PO peut démarrer le vote');
@@ -1434,8 +1654,9 @@ export function setupSocketHandlers(io: SocketServer): void {
      * Voter (tous les participants)
      * Changement de vote autorisé avant reveal
      */
-    socket.on('vote:cast', (data) => {
+    on('vote:cast', (data) => {
       if (!checkRateLimit(socket.id, RATE_LIMIT_MAX_GENERAL)) return;
+      if (!isString(data.value)) return;
       const userInfo = roomStore.getUserInfo(socket.id);
       if (!userInfo) return;
 
@@ -1467,7 +1688,7 @@ export function setupSocketHandlers(io: SocketServer): void {
      * Révéler les votes (PO uniquement)
      * Toutes les cartes deviennent visibles pour tous
      */
-    socket.on('vote:reveal', () => {
+    on('vote:reveal', () => {
       if (!checkRateLimit(socket.id, RATE_LIMIT_MAX_GENERAL)) return;
       if (!roomStore.isPO(socket.id)) {
         socket.emit('error', 'Seul le PO peut révéler les votes');
@@ -1490,7 +1711,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Réinitialiser les votes (PO uniquement)
      */
-    socket.on('vote:reset', () => {
+    on('vote:reset', () => {
       if (!checkRateLimit(socket.id, RATE_LIMIT_MAX_GENERAL)) return;
       if (!roomStore.isPO(socket.id)) {
         socket.emit('error', 'Seul le PO peut réinitialiser les votes');
@@ -1515,7 +1736,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Définir la durée du chronomètre (PO uniquement)
      */
-    socket.on('timer:set', (data) => {
+    on('timer:set', (data) => {
       if (!roomStore.isPO(socket.id)) {
         socket.emit('error', 'Seul le PO peut configurer le chronomètre');
         return;
@@ -1542,7 +1763,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Démarrer le chronomètre (PO uniquement)
      */
-    socket.on('timer:start', () => {
+    on('timer:start', () => {
       if (!roomStore.isPO(socket.id)) {
         socket.emit('error', 'Seul le PO peut démarrer le chronomètre');
         return;
@@ -1564,7 +1785,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Stopper le chronomètre (PO uniquement)
      */
-    socket.on('timer:stop', () => {
+    on('timer:stop', () => {
       if (!roomStore.isPO(socket.id)) {
         socket.emit('error', 'Seul le PO peut arrêter le chronomètre');
         return;
@@ -1586,7 +1807,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Réinitialiser le chronomètre (PO uniquement)
      */
-    socket.on('timer:reset', () => {
+    on('timer:reset', () => {
       if (!roomStore.isPO(socket.id)) {
         socket.emit('error', 'Seul le PO peut réinitialiser le chronomètre');
         return;
@@ -1610,7 +1831,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Mettre à jour le deck (PO uniquement)
      */
-    socket.on('deck:update', (data) => {
+    on('deck:update', (data) => {
       if (!checkRateLimit(socket.id, RATE_LIMIT_MAX_GENERAL)) return;
       if (!roomStore.isPO(socket.id)) {
         socket.emit('error', 'Seul le PO peut modifier le deck');
@@ -1627,6 +1848,17 @@ export function setupSocketHandlers(io: SocketServer): void {
         return;
       }
 
+      // Les images doivent être déjà présentes dans le deck de la room, statiques ou propres à cette room
+      const currentRoom = roomStore.getRoom(userInfo.roomId);
+      if (!currentRoom) return;
+      const currentUrls = collectDeckImageUrls(currentRoom.deck);
+      for (const url of collectDeckImageUrls(validatedDeck)) {
+        if (!isAllowedDeckImageUrl(url, userInfo.roomId, currentUrls)) {
+          socket.emit('error', 'Configuration de deck invalide');
+          return;
+        }
+      }
+
       const success = roomStore.updateDeck(userInfo.roomId, validatedDeck);
       if (success) {
         const room = roomStore.getRoom(userInfo.roomId);
@@ -1639,7 +1871,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Upload d'une image pour le deck (PO uniquement)
      */
-    socket.on('deck:uploadImage', async (data, callback) => {
+    on('deck:uploadImage', async (data, callback) => {
       if (!ALLOW_UPLOADS) {
         callback(false, 'Les uploads d\'images sont désactivés');
         return;
@@ -1659,22 +1891,49 @@ export function setupSocketHandlers(io: SocketServer): void {
         callback(false, 'Session expirée');
         return;
       }
+      // Capturé avant l'await : la room peut être supprimée pendant l'upload
+      const roomId = userInfo.roomId;
+
+      if (
+        (data.type !== 'front' && data.type !== 'back') ||
+        !isString(data.imageData) ||
+        (data.type === 'front' && !(isString(data.cardValue) && data.cardValue.length > 0))
+      ) {
+        callback(false, 'Données invalides');
+        return;
+      }
+
+      // Carte inexistante : refus avant toute écriture disque
+      const uploadRoom = roomStore.getRoom(roomId);
+      if (data.type === 'front' && !uploadRoom?.deck.cards.some((c) => c.value === data.cardValue)) {
+        callback(false, 'Carte introuvable');
+        return;
+      }
 
       try {
-        const uploadDir = path.join(process.cwd(), 'public', 'uploads', userInfo.roomId);
+        const uploadDir = path.join(process.cwd(), 'public', 'uploads', roomId);
         const safeCardValue = data.cardValue ? sanitizeFileName(data.cardValue) : '';
         const baseName = data.type === 'back' ? 'back' : `card_${safeCardValue}`;
 
         const result = await processImageUpload(data.imageData, uploadDir, `${baseName}.img`);
+
+        // Room supprimée pendant l'upload : le dossier vient d'être recréé, on le supprime
+        if (!roomStore.getRoom(roomId)) {
+          void deleteRoomUploads(roomId);
+          callback(false, 'Room introuvable');
+          return;
+        }
+
         if (!result.success) {
           callback(false, result.error);
           return;
         }
 
-        const url = `/uploads/${userInfo.roomId}/${result.url}`;
+        // ?t= : cache-busting (le nom de fichier est réutilisé à chaque upload)
+        const url = `/uploads/${roomId}/${result.url}?t=${Date.now()}`;
         callback(true, url);
 
-        const room = roomStore.getRoom(userInfo.roomId);
+        const room = roomStore.getRoom(roomId);
         if (room) {
           if (data.type === 'back') {
             room.deck.backImageUrl = url;
@@ -1682,7 +1941,7 @@ export function setupSocketHandlers(io: SocketServer): void {
             const card = room.deck.cards.find((c) => c.value === data.cardValue);
             if (card) card.frontImageUrl = url;
           }
-          emitRoomUpdate(io, userInfo.roomId, room);
+          emitRoomUpdate(io, roomId, room);
         }
       } catch (error: unknown) {
         console.error('Erreur upload image:', error);
@@ -1695,7 +1954,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Envoyer un emoji à un utilisateur
      */
-    socket.on('emoji:send', (data) => {
+    on('emoji:send', (data) => {
       if (!checkRateLimit(socket.id + ':emoji', 30)) return; // 30 emojis/min max
       const userInfo = roomStore.getUserInfo(socket.id);
       if (!userInfo) return;
@@ -1713,7 +1972,7 @@ export function setupSocketHandlers(io: SocketServer): void {
       if (!fromUser) return;
 
       // Valider que targetUserId est un utilisateur de la room
-      if (typeof data.targetUserId !== 'string' || !room.users[data.targetUserId]) return;
+      if (typeof data.targetUserId !== 'string' || !Object.hasOwn(room.users, data.targetUserId)) return;
 
       // Envoyer l'emoji à tous les utilisateurs de la room
       io.to(userInfo.roomId).emit('emoji:received', {
@@ -1729,7 +1988,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Récupérer les items du backlog personnel
      */
-    socket.on('backlog:getItems', (callback) => {
+    on('backlog:getItems', (callback) => {
       const accountId = userStore.getSocketAccount(socket.id);
       if (!accountId) {
         callback([]);
@@ -1742,7 +2001,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Créer un item dans le backlog personnel
      */
-    socket.on('backlog:create', (data, callback) => {
+    on('backlog:create', (data, callback) => {
       if (!checkRateLimit(socket.id, RATE_LIMIT_MAX_GENERAL)) { callback(false); return; }
       const accountId = userStore.getSocketAccount(socket.id);
       if (!accountId) {
@@ -1780,7 +2039,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Modifier un item du backlog personnel
      */
-    socket.on('backlog:update', (data, callback) => {
+    on('backlog:update', (data, callback) => {
       if (!checkRateLimit(socket.id, RATE_LIMIT_MAX_GENERAL)) { callback(false); return; }
       const accountId = userStore.getSocketAccount(socket.id);
       if (!accountId) {
@@ -1791,7 +2050,7 @@ export function setupSocketHandlers(io: SocketServer): void {
       const { itemId, title, description } = data;
 
       // Gardes de type runtime
-      if ((title !== undefined && !isString(title)) || (description !== undefined && !isString(description))) {
+      if (!isString(itemId) || (title !== undefined && !isString(title)) || (description !== undefined && !isString(description))) {
         callback(false);
         return;
       }
@@ -1816,10 +2075,15 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Supprimer un item du backlog personnel
      */
-    socket.on('backlog:delete', (data, callback) => {
+    on('backlog:delete', (data, callback) => {
       if (!checkRateLimit(socket.id, RATE_LIMIT_MAX_GENERAL)) { callback(false); return; }
       const accountId = userStore.getSocketAccount(socket.id);
       if (!accountId) {
+        callback(false);
+        return;
+      }
+
+      if (!isString(data.itemId)) {
         callback(false);
         return;
       }
@@ -1831,7 +2095,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Réordonner un item du backlog personnel
      */
-    socket.on('backlog:reorder', (data, callback) => {
+    on('backlog:reorder', (data, callback) => {
       const accountId = userStore.getSocketAccount(socket.id);
       if (!accountId) {
         callback(false);
@@ -1839,7 +2103,7 @@ export function setupSocketHandlers(io: SocketServer): void {
       }
 
       const { itemId, newPriority } = data;
-      if (!itemId || typeof newPriority !== 'number' || newPriority < 1) {
+      if (!isString(itemId) || !Number.isInteger(newPriority) || !itemId || newPriority < 1) {
         callback(false);
         return;
       }
@@ -1851,7 +2115,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Importer des items du backlog personnel vers une room
      */
-    socket.on('backlog:import', (data, callback) => {
+    on('backlog:import', (data, callback) => {
       if (!checkRateLimit(socket.id, RATE_LIMIT_MAX_GENERAL)) {
         callback(false);
         return;
@@ -1863,13 +2127,19 @@ export function setupSocketHandlers(io: SocketServer): void {
         return;
       }
 
-      const { roomId, itemIds } = data;
+      const { roomId, itemIds: rawItemIds } = data;
 
-      // Valider que itemIds est un tableau de taille raisonnable
-      if (!Array.isArray(itemIds) || itemIds.length === 0 || itemIds.length > MAX_ITEMS_PER_ROOM) {
+      if (!isString(roomId)) {
         callback(false);
         return;
       }
+
+      // Valider que itemIds est un tableau de taille raisonnable
+      if (!Array.isArray(rawItemIds) || rawItemIds.length === 0 || rawItemIds.length > MAX_ITEMS_PER_ROOM) {
+        callback(false);
+        return;
+      }
+      const itemIds = rawItemIds.filter(isString);
 
       // Vérifier que l'utilisateur est bien le PO de la room
       if (!roomStore.isPO(socket.id)) {
@@ -1925,7 +2195,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Vérifie si l'utilisateur est admin
      */
-    socket.on('admin:checkAccess', (callback) => {
+    on('admin:checkAccess', (callback) => {
       const accountId = userStore.getSocketAccount(socket.id);
       if (!accountId) {
         callback(false);
@@ -1938,7 +2208,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Récupérer tous les utilisateurs (admin uniquement)
      */
-    socket.on('admin:getAllUsers', (callback) => {
+    on('admin:getAllUsers', (callback) => {
       const accountId = userStore.getSocketAccount(socket.id);
       if (!accountId || !userStore.isAdmin(accountId)) {
         callback(false);
@@ -1957,7 +2227,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Récupérer toutes les sessions (admin uniquement)
      */
-    socket.on('admin:getAllSessions', (callback) => {
+    on('admin:getAllSessions', (callback) => {
       const accountId = userStore.getSocketAccount(socket.id);
       if (!accountId || !userStore.isAdmin(accountId)) {
         callback(false);
@@ -1976,7 +2246,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Récupérer tout l'historique des rooms (admin uniquement)
      */
-    socket.on('admin:getAllRoomHistory', (callback) => {
+    on('admin:getAllRoomHistory', (callback) => {
       const accountId = userStore.getSocketAccount(socket.id);
       if (!accountId || !userStore.isAdmin(accountId)) {
         callback(false);
@@ -1995,7 +2265,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Récupérer tous les backlogs (admin uniquement)
      */
-    socket.on('admin:getAllBacklogs', (callback) => {
+    on('admin:getAllBacklogs', (callback) => {
       const accountId = userStore.getSocketAccount(socket.id);
       if (!accountId || !userStore.isAdmin(accountId)) {
         callback(false);
@@ -2014,7 +2284,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Récupérer les statistiques globales (admin uniquement)
      */
-    socket.on('admin:getStats', (callback) => {
+    on('admin:getStats', (callback) => {
       const accountId = userStore.getSocketAccount(socket.id);
       if (!accountId || !userStore.isAdmin(accountId)) {
         callback(false);
@@ -2033,7 +2303,7 @@ export function setupSocketHandlers(io: SocketServer): void {
     /**
      * Récupérer les rooms actives (admin uniquement)
      */
-    socket.on('admin:getActiveRooms', (callback) => {
+    on('admin:getActiveRooms', (callback) => {
       const accountId = userStore.getSocketAccount(socket.id);
       if (!accountId || !userStore.isAdmin(accountId)) {
         callback(false);
@@ -2045,23 +2315,13 @@ export function setupSocketHandlers(io: SocketServer): void {
         return;
       }
 
-      const rooms = roomStore.getAllRooms();
-      const summaries = rooms.map(room => ({
-        id: room.id,
-        poUserId: room.poUserId,
-        userCount: Object.keys(room.users).length,
-        itemCount: room.items.length,
-        state: room.state,
-        hasPassword: room.hasPassword,
-        expiresAt: room.expiresAt,
-      }));
-      callback(true, summaries as unknown as Room[]);
+      callback(true, roomStore.getActiveRoomSummaries());
     });
 
     /**
      * Supprimer un utilisateur (admin uniquement)
      */
-    socket.on('admin:deleteUser', (data, callback) => {
+    on('admin:deleteUser', (data, callback) => {
       const accountId = userStore.getSocketAccount(socket.id);
       if (!accountId || !userStore.isAdmin(accountId)) {
         callback(false, 'Acces refuse');
@@ -2073,6 +2333,11 @@ export function setupSocketHandlers(io: SocketServer): void {
         return;
       }
 
+      if (!isString(data.userId)) {
+        callback(false, 'Données invalides');
+        return;
+      }
+
       // Empêcher l'admin de se supprimer lui-même
       if (data.userId === accountId) {
         callback(false, 'Impossible de supprimer votre propre compte');
@@ -2080,13 +2345,18 @@ export function setupSocketHandlers(io: SocketServer): void {
       }
 
       const success = userStore.deleteUser(data.userId);
+      if (success) {
+        // Invalider les sessions socket du compte supprimé et nettoyer ses fichiers
+        userStore.clearSocketAccountsForUser(data.userId);
+        void deleteUserUploads(data.userId);
+      }
       callback(success, success ? undefined : 'Erreur lors de la suppression');
     });
 
     /**
      * Révoquer une session (admin uniquement)
      */
-    socket.on('admin:revokeSession', (data, callback) => {
+    on('admin:revokeSession', (data, callback) => {
       const accountId = userStore.getSocketAccount(socket.id);
       if (!accountId || !userStore.isAdmin(accountId)) {
         callback(false);
@@ -2098,6 +2368,11 @@ export function setupSocketHandlers(io: SocketServer): void {
         return;
       }
 
+      if (!isString(data.token)) {
+        callback(false);
+        return;
+      }
+
       const success = userStore.revokeSessionByPrefix(data.token);
       callback(success);
     });
@@ -2105,63 +2380,37 @@ export function setupSocketHandlers(io: SocketServer): void {
     // ====== DÉCONNEXION ======
 
     socket.on('disconnect', () => {
-      handleDisconnect(socket, io);
+      try {
+        handleDisconnect(socket, io);
+      } catch (e) {
+        console.error('[socket] disconnect failed', e);
+      }
     });
   });
 }
 
 /**
  * Gère le départ d'une room (sans déconnecter la session auth)
+ * La suppression de la room (PO parti, room vide) est entièrement gérée par le store
+ * et le listener onRoomRemoved : historique, notification, timers et uploads.
  */
 function handleLeaveRoom(socket: SocketClient, io: SocketServer): void {
   const userInfo = roomStore.getUserInfo(socket.id);
-  const room = userInfo ? roomStore.getRoom(userInfo.roomId) : null;
 
   // Annuler un éventuel timer de reconnexion pending pour cet utilisateur
   if (userInfo) {
-    const timerKey = `${userInfo.roomId}:${userInfo.userId}`;
-    const timer = disconnectTimers.get(timerKey);
-    if (timer) {
-      clearTimeout(timer);
-      disconnectTimers.delete(timerKey);
-    }
+    clearDisconnectTimer(`${userInfo.roomId}:${userInfo.userId}`);
   }
 
   const result = roomStore.leaveRoom(socket.id);
 
+  if (result.roomClosed) {
+    // Le listener a tout géré (room:closed, socketsLeave, historique, uploads)
+    return;
+  }
+
   if (result.roomId && result.userId) {
-
-    // Le PO a quitté - la room est fermée pour tous
-    if (result.roomClosed && result.closedRoom) {
-      // Nettoyer les timers de déconnexion en attente pour cette room
-      for (const uid of Object.keys(result.closedRoom.users)) {
-        const tk = `${result.roomId}:${uid}`;
-        const t = disconnectTimers.get(tk);
-        if (t) {
-          clearTimeout(t);
-          disconnectTimers.delete(tk);
-        }
-      }
-
-      // Sauvegarder l'historique final
-      const creatorAccountId = roomStore.getRoomCreator(result.roomId);
-      if (creatorAccountId) {
-        userStore.updateRoomHistory(creatorAccountId, result.roomId, {
-          items: buildItemHistories(result.closedRoom),
-          isActive: false,
-          closedAt: Date.now(),
-          participantCount: Object.keys(result.closedRoom.users).length,
-        });
-      }
-
-      // Notifier tous les utilisateurs que la room est fermée
-      io.to(result.roomId).emit('room:closed', 'L\'organisateur a quitté la room. La session est terminée.');
-
-      // Faire quitter la room à tous les sockets
-      io.in(result.roomId).socketsLeave(result.roomId);
-
-      console.log(`[Room] Room ${result.roomId} closed by PO leaving`);
-    } else if (result.room) {
+    if (result.room) {
       // Un utilisateur normal a quitté — room:updated contient déjà la liste mise à jour
       emitRoomUpdate(io, result.roomId, result.room);
 
@@ -2172,23 +2421,9 @@ function handleLeaveRoom(socket: SocketClient, io: SocketServer): void {
           participantCount: Object.keys(result.room.users).length,
         });
       }
-
-      socket.leave(result.roomId);
-    } else {
-      // La room a été supprimée (dernier utilisateur parti)
-      // Sauvegarder l'historique final
-      const creatorAccountId = roomStore.getRoomCreator(result.roomId);
-      if (creatorAccountId && room) {
-        userStore.updateRoomHistory(creatorAccountId, result.roomId, {
-          items: buildItemHistories(room),
-          isActive: false,
-          closedAt: Date.now(),
-          participantCount: 0,
-        });
-      }
-
-      socket.leave(result.roomId);
     }
+
+    socket.leave(result.roomId);
   }
   // Ne pas nettoyer la session auth ici - l'utilisateur reste connecté
 }
@@ -2205,68 +2440,43 @@ function handleDisconnect(socket: SocketClient, io: SocketServer): void {
     const { roomId, userId } = pending;
     const timerKey = `${roomId}:${userId}`;
 
+    // Délai de grâce (configurable par RECONNECT_GRACE_PERIOD_MS, surtout pour les tests)
+    const gracePeriod = getEnvInt('RECONNECT_GRACE_PERIOD_MS', DEFAULT_RECONNECT_GRACE_PERIOD);
+
     // Démarrer un timer de grâce
     const timer = setTimeout(() => {
-      disconnectTimers.delete(timerKey);
+      try {
+        disconnectTimers.delete(timerKey);
 
-      const room = roomStore.getRoom(roomId);
-      const result = roomStore.executePendingDisconnect(roomId, userId);
+        const room = roomStore.getRoom(roomId);
+        const result = roomStore.executePendingDisconnect(roomId, userId);
 
-      if (result.roomClosed && result.closedRoom) {
-        // Nettoyer les timers de déconnexion en attente pour cette room
-        for (const uid of Object.keys(result.closedRoom.users)) {
-          const tk = `${roomId}:${uid}`;
-          const t = disconnectTimers.get(tk);
-          if (t) {
-            clearTimeout(t);
-            disconnectTimers.delete(tk);
+        // Room fermée (PO non revenu) ou vide : le listener onRoomRemoved a tout géré
+        if (result.roomClosed) {
+          console.log(`[Room] Room ${roomId} closed after PO disconnect timeout`);
+        } else if (result.room) {
+          // Utilisateur normal n'est pas revenu — room:updated contient la liste mise à jour
+          emitRoomUpdate(io, roomId, result.room);
+
+          const creatorAccountId = roomStore.getRoomCreator(roomId);
+          if (creatorAccountId) {
+            userStore.updateRoomHistory(creatorAccountId, roomId, {
+              participantCount: Object.keys(result.room.users).length,
+            });
           }
+
+          console.log(`[Room] User ${userId} removed from room ${roomId} after disconnect timeout`);
+        } else if (room) {
+          // La room est devenue vide et a été supprimée
+          console.log(`[Room] Room ${roomId} removed (empty) after disconnect timeout`);
         }
-
-        // PO n'est pas revenu - fermer la room
-        const creatorAccountId = roomStore.getRoomCreator(roomId);
-        if (creatorAccountId) {
-          userStore.updateRoomHistory(creatorAccountId, roomId, {
-            items: buildItemHistories(result.closedRoom),
-            isActive: false,
-            closedAt: Date.now(),
-            participantCount: Object.keys(result.closedRoom.users).length,
-          });
-        }
-
-        io.to(roomId).emit('room:closed', 'L\'organisateur a quitté la room. La session est terminée.');
-        io.in(roomId).socketsLeave(roomId);
-        console.log(`[Room] Room ${roomId} closed after PO disconnect timeout`);
-      } else if (result.room) {
-        // Utilisateur normal n'est pas revenu — room:updated contient la liste mise à jour
-        emitRoomUpdate(io, roomId, result.room);
-
-        const creatorAccountId = roomStore.getRoomCreator(roomId);
-        if (creatorAccountId) {
-          userStore.updateRoomHistory(creatorAccountId, roomId, {
-            participantCount: Object.keys(result.room.users).length,
-          });
-        }
-
-        console.log(`[Room] User ${userId} removed from room ${roomId} after disconnect timeout`);
-      } else if (room) {
-        // La room est devenue vide et a été supprimée
-        const creatorAccountId = roomStore.getRoomCreator(roomId);
-        if (creatorAccountId) {
-          userStore.updateRoomHistory(creatorAccountId, roomId, {
-            items: buildItemHistories(room),
-            isActive: false,
-            closedAt: Date.now(),
-            participantCount: 0,
-          });
-        }
-
-        console.log(`[Room] Room ${roomId} removed (empty) after disconnect timeout`);
+      } catch (e) {
+        console.error('[Room] disconnect timeout handler failed', e);
       }
-    }, RECONNECT_GRACE_PERIOD);
+    }, gracePeriod);
 
     disconnectTimers.set(timerKey, timer);
-    console.log(`[Room] User ${userId} disconnect pending for room ${roomId} (${RECONNECT_GRACE_PERIOD / 1000}s grace period)`);
+    console.log(`[Room] User ${userId} disconnect pending for room ${roomId} (${gracePeriod / 1000}s grace period)`);
   }
 
   // Nettoyer la session auth

@@ -12,6 +12,7 @@ import { DeckConfig, TableConfig } from '@/types';
 import { getCardLogoUrl } from '@/lib/cardImages';
 import ThemeToggle from '@/components/ThemeToggle';
 import LanguageToggle from '@/components/LanguageToggle';
+import { useRuntimeConfig } from '@/contexts/RuntimeConfigContext';
 
 const DEFAULT_DECK: DeckConfig = {
   cards: [
@@ -35,6 +36,15 @@ export default function AccountPage() {
   const router = useRouter();
   const t = useTranslations('account');
   const tCommon = useTranslations('common');
+  const tCard = useTranslations('card');
+
+  // Durée lisible (TTL) : 45 min, 2h, 2h 30min
+  const formatTtl = (minutes: number): string => {
+    if (minutes < 60) return t('minutesShort', { minutes });
+    const hours = Math.floor(minutes / 60);
+    const rest = minutes % 60;
+    return rest > 0 ? t('hoursMinutesShort', { hours, minutes: rest }) : t('hoursShort', { hours });
+  };
   const { account, isAuthenticated, isLoading, isServerConnected, logout, uploadDeckImage, deleteDeckImage, uploadAvatar, updateTableConfig, uploadTableImage, updateRoomTtl, maxRoomTtlMinutes } = useAuth();
   const [uploading, setUploading] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<string | null>(null);
@@ -51,7 +61,7 @@ export default function AccountPage() {
   // Deck de l'utilisateur (ou default)
   const userDeck = account?.deckConfig || DEFAULT_DECK;
   const userTable = account?.tableConfig || {};
-  const allowUploads = process.env.NEXT_PUBLIC_ALLOW_UPLOADS !== 'false';
+  const { allowUploads } = useRuntimeConfig();
 
   useEffect(() => {
     if (!isLoading && !isAuthenticated) {
@@ -324,7 +334,7 @@ export default function AccountPage() {
                 ) : account.avatarUrl ? (
                   <img
                     src={account.avatarUrl}
-                    alt="Avatar"
+                    alt={tCommon('avatar')}
                     className="w-full h-full object-cover"
                     loading="lazy"
                   />
@@ -393,7 +403,7 @@ export default function AccountPage() {
                 {userDeck.backImageUrl ? (
                   <img
                     src={userDeck.backImageUrl}
-                    alt="Dos de carte"
+                    alt={tCard('backAlt')}
                     className="w-full h-full object-cover"
                   />
                 ) : (
@@ -478,7 +488,7 @@ export default function AccountPage() {
                           }
                         `}
                       >
-                        {uploading === card.value ? '...' : 'Upload'}
+                        {uploading === card.value ? '...' : t('upload')}
                       </button>
                       <button
                         onClick={() => handleDeleteImage(card.value)}
@@ -562,7 +572,7 @@ export default function AccountPage() {
                   {userTable.imageUrl ? (
                     <img
                       src={userTable.imageUrl}
-                      alt="Table"
+                      alt={t('tablePreview')}
                       className="w-full h-full object-cover"
                     />
                   ) : (
@@ -670,11 +680,11 @@ export default function AccountPage() {
                   className="flex-1 h-2 bg-gray-200 dark:bg-gray-700 rounded-lg appearance-none cursor-pointer accent-poker-gold disabled:opacity-50"
                 />
                 <span className="text-sm font-medium text-gray-900 dark:text-white min-w-[80px] text-right">
-                  {roomTtl >= 60 ? `${Math.floor(roomTtl / 60)}h${roomTtl % 60 > 0 ? ` ${roomTtl % 60}min` : ''}` : `${roomTtl} min`}
+                  {formatTtl(roomTtl)}
                 </span>
               </div>
               <div className="flex justify-between text-xs text-gray-500 dark:text-gray-400 mt-1">
-                <span>15 min</span>
+                <span>{t('minutesShort', { minutes: 15 })}</span>
                 <span>{t('roomTtlMax', { hours: Math.floor(maxRoomTtlMinutes / 60) })}</span>
               </div>
             </div>
@@ -700,7 +710,7 @@ export default function AccountPage() {
             </button>
             {account?.roomTtlMinutes && roomTtl !== account.roomTtlMinutes && (
               <span className="text-xs text-gray-500 dark:text-gray-400">
-                {t('roomTtlCurrent')}: {account.roomTtlMinutes >= 60 ? `${Math.floor(account.roomTtlMinutes / 60)}h${account.roomTtlMinutes % 60 > 0 ? ` ${account.roomTtlMinutes % 60}min` : ''}` : `${account.roomTtlMinutes} min`}
+                {t('roomTtlCurrent')}: {formatTtl(account.roomTtlMinutes)}
               </span>
             )}
           </div>

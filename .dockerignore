@@ -45,7 +45,11 @@ coverage
 
 # Data
 data
+# Uploads de dev (avatars, images de room) : ne jamais embarquer dans l'image
+public/uploads/*
+!public/uploads/.gitkeep
 .env.production
+
 
 # Misc
 *.log

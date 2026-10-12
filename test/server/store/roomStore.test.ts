@@ -1,13 +1,8 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
-// Mock uuid pour avoir des IDs prévisibles
-vi.mock('uuid', () => ({
-  v4: vi.fn(() => 'test-uuid-' + Math.random().toString(36).substr(2, 9)),
-}));
-
-// Import après le mock
 import * as roomStore from '../../../server/store/roomStore';
 import * as userStore from '../../../server/store/userStore';
+import { isValidRoomCode } from '../../../server/utils/roomCode';
 
 describe('roomStore', () => {
   // Note: Les tests partagent le même état en mémoire
@@ -46,6 +41,31 @@ describe('roomStore', () => {
 
       expect(room.deck.cards).toHaveLength(2);
       expect(room.deck.cards[0].value).toBe('1');
+    });
+
+    it('ne copie pas le dos du deck du compte dans la room (il reste le dos personnel du PO)', () => {
+      const customDeck = {
+        cards: [{ value: '1', label: '1' }],
+        backImageUrl: '/uploads/users/u1/back.png',
+      };
+      const { room, userId } = roomStore.createRoom('Eve', 'socket-eve', undefined, customDeck, undefined, customDeck.backImageUrl);
+
+      expect(room.deck.backImageUrl).toBeUndefined();
+      expect(room.users[userId].cardBackUrl).toBe(customDeck.backImageUrl);
+      // Le deck du compte n'est pas muté
+      expect(customDeck.backImageUrl).toBe('/uploads/users/u1/back.png');
+    });
+
+    it('le deck par défaut est copié en profondeur : muter une carte n\'affecte ni une autre room ni la constante', () => {
+      const { room: roomA } = roomStore.createRoom('Fay', 'socket-fay');
+      roomA.deck.cards[0].frontImageUrl = '/uploads/AAAAAA/card_0.png';
+      roomA.deck.backImageUrl = '/uploads/AAAAAA/back.png';
+
+      const { room: roomB } = roomStore.createRoom('Gus', 'socket-gus');
+
+      expect(roomB.deck.cards[0].frontImageUrl).toBeUndefined();
+      expect(roomB.deck.backImageUrl).toBeUndefined();
+      expect(roomB.deck.cards).not.toBe(roomA.deck.cards);
     });
 
     it('devrait assigner la couleur par défaut au PO', () => {
@@ -793,6 +813,16 @@ describe('roomStore', () => {
       expect(result).toBe(false);
     });
 
+    it.each(['__proto__', 'constructor'])('devrait refuser la clé hostile "%s" sans polluer Object.prototype', (key) => {
+      const { room, userId: poId } = roomStore.createRoom('ProtoHost', 'socket-proto-' + Date.now());
+
+      const result = roomStore.transferPO(room.id, key);
+
+      expect(result).toBe(false);
+      expect(roomStore.getRoom(room.id)!.poUserId).toBe(poId);
+      expect(({} as Record<string, unknown>).isPO).toBeUndefined();
+    });
+
     it('devrait retourner false pour une room inexistante', () => {
       const result = roomStore.transferPO('NOROOM', 'any-user');
 
@@ -921,14 +951,18 @@ describe('roomStore', () => {
         const item = roomStore.createItem(timerRoomId, 'TimerItem', 'Desc');
         roomStore.selectItem(timerRoomId, item!.id);
 
-        roomStore.setTimerDuration(timerRoomId, 60000);
-        roomStore.startTimer(timerRoomId);
+        // Faux timers : l'elapsed est le temps RÉEL écoulé chrono en marche (segments)
+        vi.useFakeTimers();
+        try {
+          roomStore.setTimerDuration(timerRoomId, 60000);
+          roomStore.startTimer(timerRoomId);
 
-        // Simuler un petit délai
-        const room = roomStore.getRoom(timerRoomId);
-        room!.timerStartedAt = Date.now() - 5000; // 5 secondes dans le passé
+          vi.advanceTimersByTime(5000); // 5 secondes
 
-        roomStore.stopTimer(timerRoomId);
+          roomStore.stopTimer(timerRoomId);
+        } finally {
+          vi.useRealTimers();
+        }
 
         const updated = roomStore.getRoom(timerRoomId);
         const activeItem = updated!.items.find(i => i.id === item!.id);
@@ -993,14 +1027,18 @@ describe('roomStore', () => {
         const item2 = roomStore.createItem(timerRoomId, 'Item 2', 'Desc');
         roomStore.selectItem(timerRoomId, item1!.id);
 
-        roomStore.setTimerDuration(timerRoomId, 60000);
-        roomStore.startTimer(timerRoomId);
+        // Faux timers : 3 secondes réellement écoulées chrono en marche
+        vi.useFakeTimers();
+        try {
+          roomStore.setTimerDuration(timerRoomId, 60000);
+          roomStore.startTimer(timerRoomId);
 
-        // Simuler 3 secondes
-        const room = roomStore.getRoom(timerRoomId);
-        room!.timerStartedAt = Date.now() - 3000;
+          vi.advanceTimersByTime(3000);
 
-        roomStore.selectItem(timerRoomId, item2!.id);
+          roomStore.selectItem(timerRoomId, item2!.id);
+        } finally {
+          vi.useRealTimers();
+        }
 
         const updated = roomStore.getRoom(timerRoomId);
         const oldItem = updated!.items.find(i => i.id === item1!.id);
@@ -1216,7 +1254,7 @@ describe('roomStore', () => {
 
       expect(spy).toHaveBeenCalledTimes(1);
       const historyArg = spy.mock.calls[0][2];
-      const historyItem = historyArg.items[0];
+      const historyItem = historyArg.items![0];
       expect(historyItem.votes[poId]).toEqual({ voterName: 'ExpVoterNames', value: '5' });
       expect(historyItem.votes[devId!]).toEqual({ voterName: 'DevVoter', value: '13' });
 
@@ -1278,6 +1316,473 @@ describe('roomStore', () => {
       const expired = roomStore.cleanupExpiredRooms();
       // Pas d'erreur, retourne les rooms déjà expirées ou un tableau vide
       expect(Array.isArray(expired)).toBe(true);
+    });
+  });
+
+  describe('setRoomRemovedListener', () => {
+    afterEach(() => {
+      roomStore.setRoomRemovedListener(null);
+    });
+
+    it('PO quitte → listener { reason: po_left, userIds: [po, dev] }', () => {
+      const listener = vi.fn();
+      roomStore.setRoomRemovedListener(listener);
+      const { room, userId: poId } = roomStore.createRoom('LsPO', 'socket-ls-po-1');
+      const { userId: devId } = roomStore.joinRoom(room.id, 'LsDev', 'socket-ls-dev-1');
+
+      roomStore.leaveRoom('socket-ls-po-1');
+
+      expect(listener).toHaveBeenCalledTimes(1);
+      const event = listener.mock.calls[0][0];
+      expect(event.roomId).toBe(room.id);
+      expect(event.reason).toBe('po_left');
+      expect([...event.userIds].sort()).toEqual([poId, devId!].sort());
+    });
+
+    it('dernier dev quitte une room vide → reason empty', () => {
+      const listener = vi.fn();
+      roomStore.setRoomRemovedListener(listener);
+      // Cas « vide » : le PO est retiré de users, le dev est donc le dernier utilisateur
+      const { room: room2 } = roomStore.createRoom('LsPO3', 'socket-ls-po-3');
+      roomStore.joinRoom(room2.id, 'LsDev3', 'socket-ls-dev-3');
+      const r2 = roomStore.getRoom(room2.id)!;
+      delete r2.users[r2.poUserId];
+      r2.poUserId = 'absent';
+      roomStore.leaveRoom('socket-ls-dev-3');
+
+      expect(listener).toHaveBeenCalledTimes(1);
+      expect(listener.mock.calls[0][0]).toMatchObject({ roomId: room2.id, reason: 'empty', userIds: [] });
+    });
+
+    it('executePendingDisconnect du PO → po_disconnected', () => {
+      const listener = vi.fn();
+      roomStore.setRoomRemovedListener(listener);
+      const { room, userId } = roomStore.createRoom('LsPO4', 'socket-ls-po-4');
+      roomStore.joinRoom(room.id, 'LsDev4', 'socket-ls-dev-4');
+      roomStore.markPendingDisconnect('socket-ls-po-4');
+
+      roomStore.executePendingDisconnect(room.id, userId);
+
+      expect(listener).toHaveBeenCalledTimes(1);
+      expect(listener.mock.calls[0][0]).toMatchObject({ roomId: room.id, reason: 'po_disconnected' });
+    });
+
+    it('cleanupExpiredRooms → expired', () => {
+      const listener = vi.fn();
+      roomStore.setRoomRemovedListener(listener);
+      const { room } = roomStore.createRoom('LsPO5', 'socket-ls-po-5');
+      roomStore.getRoom(room.id)!.expiresAt = Date.now() - 1;
+
+      roomStore.cleanupExpiredRooms();
+
+      const calls = listener.mock.calls.filter((c) => c[0].roomId === room.id);
+      expect(calls).toHaveLength(1);
+      expect(calls[0][0].reason).toBe('expired');
+    });
+
+    it('un listener qui jette ne propage pas l\'erreur et la room est bien supprimée', () => {
+      const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      roomStore.setRoomRemovedListener(() => {
+        throw new Error('boom');
+      });
+      const { room } = roomStore.createRoom('LsPO6', 'socket-ls-po-6');
+
+      expect(() => roomStore.leaveRoom('socket-ls-po-6')).not.toThrow();
+      expect(roomStore.getRoom(room.id)).toBeUndefined();
+      errSpy.mockRestore();
+    });
+  });
+
+  describe('historique à la suppression', () => {
+    it('PO quitte → historique clos avec items, isActive false, closedAt et participantCount 2', () => {
+      const spy = vi.spyOn(userStore, 'updateRoomHistory').mockImplementation(() => {});
+      const { room } = roomStore.createRoom('HistPO', 'socket-hist-po-1');
+      roomStore.joinRoom(room.id, 'HistDev', 'socket-hist-dev-1');
+      roomStore.setRoomCreator(room.id, 'acc-1');
+      const item = roomStore.createItem(room.id, 'H', 'D');
+      roomStore.setItemFinalScore(room.id, item!.id, '5');
+
+      roomStore.leaveRoom('socket-hist-po-1');
+
+      expect(spy).toHaveBeenCalledWith('acc-1', room.id, {
+        items: expect.arrayContaining([expect.objectContaining({ id: item!.id, finalScore: '5' })]),
+        isActive: false,
+        closedAt: expect.any(Number),
+        participantCount: 2,
+      });
+      spy.mockRestore();
+    });
+
+    it('room vide → participantCount 0', () => {
+      const spy = vi.spyOn(userStore, 'updateRoomHistory').mockImplementation(() => {});
+      const { room } = roomStore.createRoom('HistPO2', 'socket-hist-po-2');
+      roomStore.joinRoom(room.id, 'HistDev2', 'socket-hist-dev-2');
+      roomStore.setRoomCreator(room.id, 'acc-2');
+      const r = roomStore.getRoom(room.id)!;
+      delete r.users[r.poUserId];
+      r.poUserId = 'absent';
+
+      roomStore.leaveRoom('socket-hist-dev-2');
+
+      expect(spy).toHaveBeenCalledWith('acc-2', room.id, expect.objectContaining({ isActive: false, participantCount: 0 }));
+      spy.mockRestore();
+    });
+
+    it('PO déconnecté non revenu → historique clos', () => {
+      const spy = vi.spyOn(userStore, 'updateRoomHistory').mockImplementation(() => {});
+      const { room, userId } = roomStore.createRoom('HistPO3', 'socket-hist-po-3');
+      roomStore.setRoomCreator(room.id, 'acc-3');
+      roomStore.markPendingDisconnect('socket-hist-po-3');
+
+      roomStore.executePendingDisconnect(room.id, userId);
+
+      expect(spy).toHaveBeenCalledWith('acc-3', room.id, expect.objectContaining({ isActive: false, participantCount: 1 }));
+      spy.mockRestore();
+    });
+  });
+
+  describe('nettoyage mémoire', () => {
+    it('PO quitte alors qu\'un dev est pending → toutes les structures reviennent à la baseline', () => {
+      const before = roomStore._debugStateSizes();
+      const { room } = roomStore.createRoom('MemPO', 'socket-mem-po-1', 'pwd');
+      roomStore.setRoomCreator(room.id, 'acc-mem-1');
+      roomStore.joinRoom(room.id, 'MemDev', 'socket-mem-dev-1', 'pwd');
+      roomStore.markPendingDisconnect('socket-mem-dev-1');
+      expect(roomStore._debugStateSizes().pendingDisconnects).toBe(before.pendingDisconnects + 1);
+
+      roomStore.leaveRoom('socket-mem-po-1');
+
+      expect(roomStore._debugStateSizes()).toEqual(before);
+    });
+
+    it('room vide → structures à la baseline', () => {
+      const before = roomStore._debugStateSizes();
+      const { room } = roomStore.createRoom('MemPO2', 'socket-mem-po-2');
+      roomStore.setRoomCreator(room.id, 'acc-mem-2');
+      roomStore.joinRoom(room.id, 'MemDev2', 'socket-mem-dev-2');
+      const r = roomStore.getRoom(room.id)!;
+      delete r.users[r.poUserId];
+      r.poUserId = 'absent';
+      roomStore.leaveRoom('socket-mem-po-2'); // retire aussi le mapping du PO
+      roomStore.leaveRoom('socket-mem-dev-2');
+
+      expect(roomStore.getRoom(room.id)).toBeUndefined();
+      expect(roomStore._debugStateSizes()).toEqual(before);
+    });
+
+    it('timerSegments est nettoyé à la suppression', () => {
+      const before = roomStore._debugStateSizes();
+      const { room } = roomStore.createRoom('MemPO3', 'socket-mem-po-3');
+      roomStore.setTimerDuration(room.id, 60000);
+      roomStore.startTimer(room.id);
+      expect(roomStore._debugStateSizes().timerSegments).toBe(before.timerSegments + 1);
+
+      roomStore.leaveRoom('socket-mem-po-3');
+
+      expect(roomStore._debugStateSizes()).toEqual(before);
+    });
+
+    it('cancelPendingDisconnect ne laisse pas de Set vide', () => {
+      const before = roomStore._debugStateSizes();
+      const { room } = roomStore.createRoom('MemPO4', 'socket-mem-po-4');
+      const { userId, reconnectSecret } = roomStore.joinRoom(room.id, 'MemDev4', 'socket-mem-dev-4');
+      roomStore.markPendingDisconnect('socket-mem-dev-4');
+      expect(roomStore._debugStateSizes().pendingDisconnectsByRoom).toBe(before.pendingDisconnectsByRoom + 1);
+
+      const restored = roomStore.cancelPendingDisconnect(room.id, userId!, 'socket-mem-dev-4b', reconnectSecret);
+
+      expect(restored).toBeDefined();
+      expect(roomStore._debugStateSizes().pendingDisconnects).toBe(before.pendingDisconnects);
+      expect(roomStore._debugStateSizes().pendingDisconnectsByRoom).toBe(before.pendingDisconnectsByRoom);
+      roomStore.leaveRoom('socket-mem-po-4');
+    });
+
+    it('executePendingDisconnect d\'un dev ne laisse pas de Set vide', () => {
+      const before = roomStore._debugStateSizes();
+      const { room } = roomStore.createRoom('MemPO5', 'socket-mem-po-5');
+      const { userId } = roomStore.joinRoom(room.id, 'MemDev5', 'socket-mem-dev-5');
+      roomStore.markPendingDisconnect('socket-mem-dev-5');
+
+      roomStore.executePendingDisconnect(room.id, userId!);
+
+      expect(roomStore._debugStateSizes().pendingDisconnectsByRoom).toBe(before.pendingDisconnectsByRoom);
+      roomStore.leaveRoom('socket-mem-po-5');
+    });
+  });
+
+  describe('checkJoinable / getReconnectSecret', () => {
+    it('room introuvable', () => {
+      expect(roomStore.checkJoinable('ZZZZZZ')).toEqual({ ok: false, error: 'Room introuvable' });
+    });
+
+    it('room sans mot de passe → ok, sans effet de bord', () => {
+      const { room } = roomStore.createRoom('JoinPO', 'socket-cj-po-1');
+      const before = Object.keys(roomStore.getRoom(room.id)!.users).length;
+
+      expect(roomStore.checkJoinable(room.id)).toEqual({ ok: true });
+      expect(Object.keys(roomStore.getRoom(room.id)!.users)).toHaveLength(before);
+      roomStore.leaveRoom('socket-cj-po-1');
+    });
+
+    it('mot de passe requis / incorrect / correct', () => {
+      const { room } = roomStore.createRoom('JoinPO2', 'socket-cj-po-2', 'secret');
+
+      expect(roomStore.checkJoinable(room.id)).toEqual({ ok: false, error: 'Mot de passe incorrect' });
+      expect(roomStore.checkJoinable(room.id, 'faux')).toEqual({ ok: false, error: 'Mot de passe incorrect' });
+      expect(roomStore.checkJoinable(room.id, 'secret')).toEqual({ ok: true });
+      roomStore.leaveRoom('socket-cj-po-2');
+    });
+
+    it('getReconnectSecret retourne le secret émis à la création et au join', () => {
+      const { room, userId, reconnectSecret } = roomStore.createRoom('JoinPO3', 'socket-cj-po-3');
+      const joined = roomStore.joinRoom(room.id, 'JoinDev3', 'socket-cj-dev-3');
+
+      expect(roomStore.getReconnectSecret(room.id, userId)).toBe(reconnectSecret);
+      expect(roomStore.getReconnectSecret(room.id, joined.userId!)).toBe(joined.reconnectSecret);
+      expect(roomStore.getReconnectSecret(room.id, 'inconnu')).toBeUndefined();
+      roomStore.leaveRoom('socket-cj-po-3');
+    });
+
+    it('après suppression de la room, le secret n\'existe plus', () => {
+      const { room, userId } = roomStore.createRoom('JoinPO4', 'socket-cj-po-4');
+      roomStore.leaveRoom('socket-cj-po-4');
+
+      expect(roomStore.getReconnectSecret(room.id, userId)).toBeUndefined();
+    });
+  });
+
+  describe('timer — elapsedTime exact', () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    function setup() {
+      vi.useFakeTimers();
+      vi.setSystemTime(0);
+      const { room } = roomStore.createRoom('ChronoPO', 'socket-chrono-' + Math.random());
+      const item1 = roomStore.createItem(room.id, 'C1', '')!;
+      const item2 = roomStore.createItem(room.id, 'C2', '')!;
+      roomStore.selectItem(room.id, item1.id);
+      roomStore.setTimerDuration(room.id, 60000);
+      return { room, item1, item2 };
+    }
+
+    it('pause puis reprise : elapsed = temps chrono en marche (30 000 et non 50 000)', () => {
+      const { room, item1 } = setup();
+      roomStore.startTimer(room.id); // t=0
+      vi.setSystemTime(10_000);
+      roomStore.stopTimer(room.id);
+      expect(room.items.find((i) => i.id === item1.id)!.elapsedTime).toBe(10_000);
+
+      vi.setSystemTime(15_000);
+      roomStore.startTimer(room.id);
+      vi.setSystemTime(35_000);
+      roomStore.stopTimer(room.id);
+
+      expect(room.items.find((i) => i.id === item1.id)!.elapsedTime).toBe(30_000);
+      expect(room.timerStoppedRemaining).toBe(30_000);
+    });
+
+    it('changement d\'item après une reprise : somme exacte des segments', () => {
+      const { room, item1, item2 } = setup();
+      roomStore.startTimer(room.id); // t=0
+      vi.setSystemTime(10_000);
+      roomStore.stopTimer(room.id); // item1 = 10 000
+      vi.setSystemTime(12_000);
+      roomStore.startTimer(room.id);
+      vi.setSystemTime(27_000);
+      roomStore.selectItem(room.id, item2.id); // item1 += 15 000 = 25 000
+      vi.setSystemTime(32_000);
+      roomStore.stopTimer(room.id); // item2 = 5 000
+
+      expect(room.items.find((i) => i.id === item1.id)!.elapsedTime).toBe(25_000);
+      expect(room.items.find((i) => i.id === item2.id)!.elapsedTime).toBe(5_000);
+    });
+
+    it('resetTimer en cours : le segment est ajouté à l\'item actif', () => {
+      const { room, item1 } = setup();
+      const segmentsBefore = roomStore._debugStateSizes().timerSegments;
+      roomStore.startTimer(room.id);
+      expect(roomStore._debugStateSizes().timerSegments).toBe(segmentsBefore + 1);
+      vi.setSystemTime(7_000);
+
+      roomStore.resetTimer(room.id);
+
+      expect(room.items.find((i) => i.id === item1.id)!.elapsedTime).toBe(7_000);
+      expect(room.timerStartedAt).toBeUndefined();
+      expect(roomStore._debugStateSizes().timerSegments).toBe(segmentsBefore);
+    });
+
+    it('setTimerDuration en cours : le segment est ajouté à l\'item actif', () => {
+      const { room, item1 } = setup();
+      roomStore.startTimer(room.id);
+      vi.setSystemTime(4_000);
+
+      roomStore.setTimerDuration(room.id, 120_000);
+
+      expect(room.items.find((i) => i.id === item1.id)!.elapsedTime).toBe(4_000);
+      expect(room.timerStartedAt).toBeUndefined();
+    });
+
+    it('chrono en cours sans item actif puis sélection : pas de flush, nouveau segment', () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(0);
+      const { room } = roomStore.createRoom('ChronoPO2', 'socket-chrono2-' + Math.random());
+      const item = roomStore.createItem(room.id, 'C', '')!;
+      roomStore.setTimerDuration(room.id, 60000);
+      roomStore.startTimer(room.id);
+      vi.setSystemTime(5_000);
+      const startedAtBefore = room.timerStartedAt;
+
+      roomStore.selectItem(room.id, item.id);
+      expect(room.timerStartedAt).toBe(startedAtBefore);
+
+      vi.setSystemTime(9_000);
+      roomStore.stopTimer(room.id);
+
+      // Seuls les 4 s écoulés depuis la sélection comptent pour l'item
+      expect(room.items[0].elapsedTime).toBe(4_000);
+    });
+  });
+
+  describe('getActiveRoomSummaries', () => {
+    it('retourne la forme exacte avec poName, participants et itemCount', () => {
+      const { room, userId } = roomStore.createRoom('SumPO', 'socket-sum-po-1', 'pwd');
+      const joined = roomStore.joinRoom(room.id, 'SumDev', 'socket-sum-dev-1', 'pwd');
+      roomStore.createItem(room.id, 'I1', '');
+      roomStore.createItem(room.id, 'I2', '');
+
+      const summary = roomStore.getActiveRoomSummaries().find((s) => s.id === room.id)!;
+
+      expect(Object.keys(summary).sort()).toEqual(
+        ['createdAt', 'expiresAt', 'hasPassword', 'id', 'itemCount', 'participants', 'poName', 'state', 'userCount'].sort()
+      );
+      expect(summary.poName).toBe('SumPO');
+      expect(summary.userCount).toBe(2);
+      expect(summary.itemCount).toBe(2);
+      expect(summary.state).toBe('idle');
+      expect(summary.hasPassword).toBe(true);
+      expect(summary.participants).toEqual(expect.arrayContaining([
+        { id: userId, name: 'SumPO', isPO: true },
+        { id: joined.userId, name: 'SumDev', isPO: false },
+      ]));
+      roomStore.leaveRoom('socket-sum-po-1');
+    });
+
+    it('poName null si le PO n\'est plus dans users', () => {
+      const { room } = roomStore.createRoom('SumPO2', 'socket-sum-po-2');
+      const r = roomStore.getRoom(room.id)!;
+      delete r.users[r.poUserId];
+
+      const summary = roomStore.getActiveRoomSummaries().find((s) => s.id === room.id)!;
+      expect(summary.poName).toBeNull();
+      roomStore.leaveRoom('socket-sum-po-2');
+    });
+  });
+
+  describe('generateRoomCode', () => {
+    it('les ids générés respectent le format des codes de room', () => {
+      for (let i = 0; i < 20; i++) {
+        const { room } = roomStore.createRoom('CodePO', `socket-code-${i}`);
+        expect(isValidRoomCode(room.id)).toBe(true);
+        roomStore.leaveRoom(`socket-code-${i}`);
+      }
+    });
+  });
+
+  describe('échec de la clôture d\'historique (SQLite)', () => {
+    afterEach(() => {
+      roomStore.setRoomRemovedListener(null);
+      vi.restoreAllMocks();
+    });
+
+    it('PO en délai de grâce : la room est supprimée, les maps sont propres et le listener est appelé', () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      vi.spyOn(userStore, 'updateRoomHistory').mockImplementation(() => {
+        throw new Error('SQLITE_READONLY');
+      });
+      const listener = vi.fn();
+      const before = roomStore._debugStateSizes();
+      const { room, userId } = roomStore.createRoom('FailPO', 'socket-fail-po-1', 'pwd');
+      roomStore.setRoomCreator(room.id, 'acc-fail');
+      roomStore.joinRoom(room.id, 'FailDev', 'socket-fail-dev-1', 'pwd');
+      roomStore.markPendingDisconnect('socket-fail-po-1');
+      roomStore.setRoomRemovedListener(listener);
+
+      expect(() => roomStore.executePendingDisconnect(room.id, userId)).not.toThrow();
+
+      expect(roomStore.getRoom(room.id)).toBeUndefined();
+      expect(listener).toHaveBeenCalledWith(expect.objectContaining({ roomId: room.id, reason: 'po_disconnected' }));
+      // Le dev (socket actif) n'est pas compté dans `before` : on nettoie son mapping via la room supprimée
+      expect(roomStore._debugStateSizes()).toEqual(before);
+    });
+
+    it('PO quitte (leaveRoom) : room supprimée malgré l\'échec', () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      vi.spyOn(userStore, 'updateRoomHistory').mockImplementation(() => {
+        throw new Error('SQLITE_FULL');
+      });
+      const { room } = roomStore.createRoom('FailPO2', 'socket-fail-po-2');
+      roomStore.setRoomCreator(room.id, 'acc-fail-2');
+
+      expect(() => roomStore.leaveRoom('socket-fail-po-2')).not.toThrow();
+      expect(roomStore.getRoom(room.id)).toBeUndefined();
+    });
+
+    it('cleanupExpiredRooms : deux rooms expirées sont toutes deux supprimées', () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      vi.spyOn(userStore, 'updateRoomHistory').mockImplementation(() => {
+        throw new Error('SQLITE_BUSY');
+      });
+      const listener = vi.fn();
+      roomStore.setRoomRemovedListener(listener);
+      const before = roomStore._debugStateSizes();
+      const { room: r1 } = roomStore.createRoom('FailExp1', 'socket-fail-exp-1');
+      const { room: r2 } = roomStore.createRoom('FailExp2', 'socket-fail-exp-2');
+      roomStore.setRoomCreator(r1.id, 'acc-exp-1');
+      roomStore.setRoomCreator(r2.id, 'acc-exp-2');
+      roomStore.getRoom(r1.id)!.expiresAt = Date.now() - 1;
+      roomStore.getRoom(r2.id)!.expiresAt = Date.now() - 1;
+
+      const expired = roomStore.cleanupExpiredRooms();
+
+      expect(expired).toEqual(expect.arrayContaining([r1.id, r2.id]));
+      expect(roomStore.getRoom(r1.id)).toBeUndefined();
+      expect(roomStore.getRoom(r2.id)).toBeUndefined();
+      expect(listener.mock.calls.map((c) => c[0].roomId)).toEqual(expect.arrayContaining([r1.id, r2.id]));
+      // Maps propres pour ces deux rooms (cleanupExpiredRooms purge aussi d'éventuelles rooms expirées d'autres tests)
+      expect(roomStore.getUserInfo('socket-fail-exp-1')).toBeUndefined();
+      expect(roomStore.getUserInfo('socket-fail-exp-2')).toBeUndefined();
+      expect(roomStore.getRoomCreator(r1.id)).toBeUndefined();
+      expect(roomStore.getRoomCreator(r2.id)).toBeUndefined();
+      const after = roomStore._debugStateSizes();
+      expect(after.rooms).toBeLessThanOrEqual(before.rooms);
+      expect(after.roomCreators).toBeLessThanOrEqual(before.roomCreators);
+      expect(after.reconnectSecrets).toBeLessThanOrEqual(before.reconnectSecrets);
+    });
+  });
+
+  describe('isValidReconnectRequest', () => {
+    it('lecture seule : valide avec le bon secret, sans rien muter', () => {
+      const { room } = roomStore.createRoom('RcPO', 'socket-rc-po-1');
+      const { userId, reconnectSecret } = roomStore.joinRoom(room.id, 'RcDev', 'socket-rc-dev-1');
+      roomStore.markPendingDisconnect('socket-rc-dev-1');
+      const before = roomStore._debugStateSizes();
+
+      expect(roomStore.isValidReconnectRequest(room.id, userId!, reconnectSecret)).toBe(true);
+      expect(roomStore.isValidReconnectRequest(room.id, userId!, 'faux')).toBe(false);
+      expect(roomStore.isValidReconnectRequest(room.id, userId!, undefined)).toBe(false);
+      expect(roomStore.isValidReconnectRequest(room.id, 'inconnu', reconnectSecret)).toBe(false);
+      expect(roomStore._debugStateSizes()).toEqual(before);
+      roomStore.leaveRoom('socket-rc-po-1');
+    });
+
+    it('faux si aucune déconnexion en attente', () => {
+      const { room } = roomStore.createRoom('RcPO2', 'socket-rc-po-2');
+      const { userId, reconnectSecret } = roomStore.joinRoom(room.id, 'RcDev2', 'socket-rc-dev-2');
+
+      expect(roomStore.isValidReconnectRequest(room.id, userId!, reconnectSecret)).toBe(false);
+      roomStore.leaveRoom('socket-rc-po-2');
     });
   });
 

@@ -21,6 +21,29 @@ export const DEFAULT_LAYOUT: LayoutConfig = [
 export const MAX_PER_ROW = 2;
 
 /**
+ * Classe Tailwind de la grille d'une ligne de panneaux.
+ * Chaînes littérales complètes obligatoires (scan Tailwind via @source).
+ * Mobile : une colonne ; `md:` pour les lignes de 2, `lg:` pour les lignes de 3
+ * (à 768 px, `1fr_280px_280px` laisserait moins de 210 px à la table).
+ */
+export function getRowGridClass(row: RoomPanelId[]): string {
+  const tableIdx = row.indexOf('pokerTable');
+  const hasTable = tableIdx !== -1;
+
+  if (row.length <= 1) return 'grid-cols-1';
+
+  if (row.length === 2) {
+    if (!hasTable) return 'grid-cols-1 md:grid-cols-2';
+    return tableIdx === 0 ? 'grid-cols-1 md:grid-cols-[1fr_320px]' : 'grid-cols-1 md:grid-cols-[320px_1fr]';
+  }
+
+  if (!hasTable) return 'grid-cols-1 lg:grid-cols-3';
+  if (tableIdx === 0) return 'grid-cols-1 lg:grid-cols-[1fr_280px_280px]';
+  if (tableIdx === 1) return 'grid-cols-1 lg:grid-cols-[280px_1fr_280px]';
+  return 'grid-cols-1 lg:grid-cols-[280px_280px_1fr]';
+}
+
+/**
  * Fusionne un layout sauvegardé avec les valeurs par défaut.
  * Gère la migration depuis l'ancien format (tableau plat) vers le nouveau (tableau de lignes).
  */

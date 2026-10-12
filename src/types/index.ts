@@ -162,6 +162,43 @@ export interface Room {
 }
 
 /**
+ * Raison de fermeture d'une room notifiée aux clients
+ */
+export type RoomClosedReason = 'po_left' | 'expired';
+
+/**
+ * Payload de l'événement room:closed
+ */
+export interface RoomClosedPayload {
+  roomId: string;
+  reason: RoomClosedReason;
+}
+
+/**
+ * Participant d'une room vu par l'admin
+ */
+export interface AdminActiveRoomParticipant {
+  id: string;
+  name: string;
+  isPO: boolean;
+}
+
+/**
+ * Résumé d'une room active pour le dashboard admin
+ */
+export interface AdminActiveRoomSummary {
+  id: string;
+  poName: string | null;
+  participants: AdminActiveRoomParticipant[];
+  userCount: number;
+  itemCount: number;
+  state: RoomState;
+  hasPassword: boolean;
+  createdAt: number;
+  expiresAt: number;
+}
+
+/**
  * Statistiques calculées après reveal
  */
 export interface VoteStatistics {
@@ -180,7 +217,7 @@ export interface ClientToServerEvents {
   // Authentification
   'auth:register': (data: { email: string; password: string; name: string; role: UserRole; authType?: AuthType; pseudo?: string }, callback: (success: boolean, account?: UserAccount, error?: string, sessionToken?: string) => void) => void;
   'auth:login': (data: { email: string; password: string; authType?: AuthType; pseudo?: string }, callback: (success: boolean, account?: UserAccount, error?: string, sessionToken?: string) => void) => void;
-  'auth:reconnect': (data: { accountId: string; sessionToken?: string }, callback: (success: boolean, account?: UserAccount) => void) => void;
+  'auth:reconnect': (data: { accountId: string; sessionToken?: string }, callback: (success: boolean, account?: UserAccount, reason?: 'invalid_session') => void) => void;
   'auth:logout': (data?: { sessionToken?: string }) => void;
   'auth:getHistory': (callback: (rooms: RoomHistory[]) => void) => void;
   'auth:deleteRoomHistory': (data: { historyId: string }, callback: (success: boolean) => void) => void;
@@ -193,8 +230,8 @@ export interface ClientToServerEvents {
   'auth:updateRoomTtl': (data: { ttlMinutes: number }, callback: (success: boolean, error?: string) => void) => void;
   'auth:updateLayoutConfig': (data: { layoutConfig: LayoutConfig }, callback: (success: boolean) => void) => void;
   'auth:forgotPassword': (data: { email: string }, callback: (success: boolean, error?: string) => void) => void;
-  'auth:verifyResetCode': (data: { code: string }, callback: (valid: boolean, error?: string) => void) => void;
-  'auth:resetPassword': (data: { code: string; newPassword: string }, callback: (success: boolean, error?: string) => void) => void;
+  'auth:verifyResetCode': (data: { email: string; code: string }, callback: (valid: boolean, error?: string) => void) => void;
+  'auth:resetPassword': (data: { email: string; code: string; newPassword: string }, callback: (success: boolean, error?: string) => void) => void;
 
   // Gestion des rooms
   'room:create': (data: { userName: string; password?: string; cardColor?: string }, callback: (room: Room, userId: string, reconnectSecret?: string) => void) => void;
@@ -249,7 +286,7 @@ export interface ClientToServerEvents {
   'admin:getAllRoomHistory': (callback: (success: boolean, histories?: RoomHistory[]) => void) => void;
   'admin:getAllBacklogs': (callback: (success: boolean, backlogs?: { userId: string; userName: string; userEmail: string; items: BacklogItem[] }[]) => void) => void;
   'admin:getStats': (callback: (success: boolean, stats?: AdminStats) => void) => void;
-  'admin:getActiveRooms': (callback: (success: boolean, rooms?: Room[]) => void) => void;
+  'admin:getActiveRooms': (callback: (success: boolean, rooms?: AdminActiveRoomSummary[]) => void) => void;
   'admin:deleteUser': (data: { userId: string }, callback: (success: boolean, error?: string) => void) => void;
   'admin:revokeSession': (data: { token: string }, callback: (success: boolean) => void) => void;
 }
@@ -261,7 +298,7 @@ export interface ServerToClientEvents {
   'room:updated': (room: Room) => void;
   'room:userJoined': (user: User) => void;
   'room:userLeft': (userId: string) => void;
-  'room:closed': (reason: string) => void;
+  'room:closed': (payload: RoomClosedPayload) => void;
   'vote:cast': (userId: string, hasVoted: boolean) => void;
   'vote:revealed': (votes: Record<string, Vote>) => void;
   'vote:reset': () => void;

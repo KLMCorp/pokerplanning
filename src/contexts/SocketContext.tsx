@@ -7,7 +7,10 @@
 
 import React, { createContext, useContext, useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { Socket } from 'socket.io-client';
+import { useTranslations } from 'next-intl';
 import { getSocket, connectSocket, disconnectSocket } from '@/lib/socket';
+import { resolveSocketUrl } from '@/lib/runtimeConfig';
+import { useRuntimeConfig } from './RuntimeConfigContext';
 import {
   Room,
   User,
@@ -19,8 +22,12 @@ import {
   AdminStats,
   SessionInfo,
   AdminUserAccount,
+  AdminActiveRoomSummary,
+  RoomClosedPayload,
   RoomHistory,
 } from '@/types';
+import { normalizeRoomCode, shouldAcceptRoomEvent } from '@/lib/roomEvents';
+import { deckHasCard } from '@/lib/utils';
 
 interface EmojiEvent {
   id: string;
@@ -41,6 +48,7 @@ interface SocketContextType {
   currentUser: User | null;
   isPO: boolean;
   error: string | null;
+  roomClosedNotice: RoomClosedPayload | null;
 
   // Actions Room
   createRoom: (userName: string, password?: string, cardColor?: string) => Promise<{ room: Room; userId: string } | null>;
@@ -100,10 +108,11 @@ interface SocketContextType {
   adminGetStats: () => Promise<AdminStats | null>;
   adminDeleteUser: (userId: string) => Promise<{ success: boolean; error?: string }>;
   adminRevokeSession: (token: string) => Promise<boolean>;
-  adminGetActiveRooms: () => Promise<Room[]>;
+  adminGetActiveRooms: () => Promise<AdminActiveRoomSummary[]>;
 
   // Utilitaires
   clearError: () => void;
+  clearRoomClosedNotice: () => void;
 }
 
 // ====== SESSION STORAGE HELPERS (pour reconnexion room après F5) ======
@@ -149,10 +158,26 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
   const [socket, setSocket] = useState<Socket<ServerToClientEvents, ClientToServerEvents> | null>(null);
   const [isConnected, setIsConnected] = useState(false);
   const [isReconnecting, setIsReconnecting] = useState(() => getSavedRoomSession() !== null);
+  const { socketUrl } = useRuntimeConfig();
   const [room, setRoom] = useState<Room | null>(null);
   const [userId, setUserId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [flyingEmojis, setFlyingEmojis] = useState<EmojiEvent[]>([]);
+  const [roomClosedNotice, setRoomClosedNotice] = useState<RoomClosedPayload | null>(null);
+
+  // Room active côté client : filtre les événements tardifs d'une ancienne room.
+  // Positionnée AVANT l'emit de join/create/reconnect car room:updated peut précéder l'ack.
+  const activeRoomIdRef = useRef<string | null>(null);
+
+  // Création de room en cours : sérialise les createRoom rapprochés (sinon le room:closed de la
+  // première room, fermée par la seconde création, serait accepté et afficherait un faux toast)
+  const createInFlightRef = useRef(false);
+
+  // Room courante accessible aux callbacks stables
+  const roomRef = useRef<Room | null>(null);
+  useEffect(() => {
+    roomRef.current = room;
+  }, [room]);
 
   // Refs pour cleanup des timeouts emojis
   const emojiTimeoutsRef = useRef<ReturnType<typeof setTimeout>[]>([]);
@@ -160,6 +185,13 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
   // Ref stable pour éviter de recréer les callbacks quand socket change
   const socketRef = useRef(socket);
   socketRef.current = socket;
+
+  // Traductions via ref (synchronisée en effet) pour garder des callbacks stables
+  const tCommon = useTranslations('common');
+  const tCommonRef = useRef(tCommon);
+  useEffect(() => {
+    tCommonRef.current = tCommon;
+  }, [tCommon]);
 
   // Utilisateur courant — stable reference tant que le contenu ne change pas
   const currentUserRef = useRef<User | null>(null);
@@ -181,7 +213,8 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
 
   // Initialisation du socket
   useEffect(() => {
-    const s = getSocket();
+    // URL résolue côté client uniquement (window) : config runtime du serveur, sinon heuristique (http :3000 → :3001, origine)
+    const s = getSocket(resolveSocketUrl(socketUrl, window.location, process.env.NODE_ENV === 'production'));
     setSocket(s);
 
     // Événements de connexion
@@ -192,11 +225,13 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
       const savedSession = getSavedRoomSession();
       if (savedSession) {
         setIsReconnecting(true);
+        activeRoomIdRef.current = savedSession.roomId;
         s.emit('room:reconnect', { roomId: savedSession.roomId, userId: savedSession.userId, secret: savedSession.secret }, (success, reconnectedRoom, reconnectedUserId) => {
           if (success && reconnectedRoom && reconnectedUserId) {
             setRoom(reconnectedRoom);
             setUserId(reconnectedUserId);
           } else {
+            activeRoomIdRef.current = null;
             clearRoomSession();
           }
           setIsReconnecting(false);
@@ -210,6 +245,7 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
 
     // Événements de la room
     s.on('room:updated', (updatedRoom) => {
+      if (!shouldAcceptRoomEvent(activeRoomIdRef.current, updatedRoom.id)) return;
       setRoom(updatedRoom);
     });
 
@@ -226,12 +262,14 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
       setError(message);
     });
 
-    // Room fermée par le PO
-    s.on('room:closed', (reason) => {
-      setError(reason);
+    // Room fermée (PO parti, expiration) : l'affichage du message est délégué à RoomClosedNotifier
+    s.on('room:closed', (payload) => {
+      if (!shouldAcceptRoomEvent(activeRoomIdRef.current, payload.roomId)) return;
+      activeRoomIdRef.current = null;
       setRoom(null);
       setUserId(null);
       clearRoomSession();
+      setRoomClosedNotice(payload);
     });
 
     // Emojis
@@ -267,7 +305,8 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
       emojiTimeoutsRef.current = [];
       disconnectSocket();
     };
-  }, []);
+    // socketUrl est constante pour la page (props du layout) : l'effet ne tourne qu'une fois
+  }, [socketUrl]);
 
   // ====== ACTIONS ROOM ======
   // Toutes les callbacks utilisent socketRef/isPORef au lieu de socket/isPO
@@ -277,9 +316,56 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
     async (userName: string, password?: string, cardColor?: string): Promise<{ room: Room; userId: string } | null> => {
       const s = socketRef.current;
       if (!s) return null;
+      if (createInFlightRef.current) return null;
+      createInFlightRef.current = true;
+
+      // Événements de l'ancienne room ignorés dès maintenant ; restaurée si la création échoue
+      // (le serveur ne quitte l'ancienne room qu'une fois les validations passées)
+      const previous = activeRoomIdRef.current;
+      activeRoomIdRef.current = null;
 
       return new Promise((resolve) => {
+        // Le serveur refuse (rate limit, plafond de rooms…) en émettant 'error' sans appeler l'ack
+        let settled = false;
+        const cleanup = () => {
+          s.off('error', onError);
+          s.off('disconnect', onDisconnect);
+        };
+        const onError = () => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          createInFlightRef.current = false;
+          activeRoomIdRef.current = previous;
+          resolve(null);
+        };
+        // Déconnexion pendant la création : l'ack n'arrivera jamais
+        const onDisconnect = () => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          createInFlightRef.current = false;
+          activeRoomIdRef.current = previous;
+          resolve(null);
+        };
+        s.on('error', onError);
+        s.on('disconnect', onDisconnect);
         s.emit('room:create', { userName, password, cardColor }, (newRoom, newUserId, reconnectSecret) => {
+          if (settled) {
+            // Ack tardif après une résolution à null : on n'adopte pas la room (aucune navigation)
+            // et on la quitte pour ne pas laisser de room orpheline côté serveur.
+            // Le serveur a déjà quitté l'ancienne room : l'état local périmé est purgé.
+            s.emit('room:leave');
+            activeRoomIdRef.current = null;
+            setRoom(null);
+            setUserId(null);
+            clearRoomSession();
+            return;
+          }
+          settled = true;
+          cleanup();
+          createInFlightRef.current = false;
+          activeRoomIdRef.current = newRoom.id;
           setRoom(newRoom);
           setUserId(newUserId);
           if (reconnectSecret) saveRoomSession(newRoom.id, newUserId, reconnectSecret);
@@ -300,15 +386,22 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
       const s = socketRef.current;
       if (!s) return null;
 
+      // Positionné AVANT l'emit : un room:updated de la cible peut précéder l'ack
+      const target = normalizeRoomCode(roomId);
+      const previous = activeRoomIdRef.current;
+      activeRoomIdRef.current = target;
+
       return new Promise((resolve) => {
-        s.emit('room:join', { roomId, userName, password, cardColor }, (success, joinedRoom, joinedUserId, err, reconnectSecret) => {
+        s.emit('room:join', { roomId: target, userName, password, cardColor }, (success, joinedRoom, joinedUserId, err, reconnectSecret) => {
           if (success && joinedRoom && joinedUserId) {
             setRoom(joinedRoom);
             setUserId(joinedUserId);
             if (reconnectSecret) saveRoomSession(joinedRoom.id, joinedUserId, reconnectSecret);
             resolve({ room: joinedRoom, userId: joinedUserId });
           } else {
-            setError(err || 'Erreur lors de la connexion à la room');
+            // Le serveur ne nous a pas fait quitter l'ancienne room
+            activeRoomIdRef.current = previous;
+            setError(err || tCommonRef.current('roomJoinError'));
             resolve(null);
           }
         });
@@ -334,6 +427,7 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
   const leaveRoom = useCallback(() => {
     const s = socketRef.current;
     if (!s) return;
+    activeRoomIdRef.current = null;
     s.emit('room:leave');
     setRoom(null);
     setUserId(null);
@@ -416,8 +510,10 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
     const s = socketRef.current;
     if (!s || !isPORef.current) return;
     s.emit('vote:start');
-    // L'organisateur vote automatiquement "?" par défaut
-    s.emit('vote:cast', { value: '?' });
+    // L'organisateur vote automatiquement "?" par défaut, si le deck contient cette carte
+    if (deckHasCard(roomRef.current?.deck, '?')) {
+      s.emit('vote:cast', { value: '?' });
+    }
   }, []);
 
   const castVote = useCallback(
@@ -492,6 +588,7 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
 
       return new Promise((resolve) => {
         const reader = new FileReader();
+        reader.onerror = () => resolve(null);
         reader.onload = () => {
           const imageData = reader.result as string;
           s.emit(
@@ -691,7 +788,7 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
 
   const adminDeleteUser = useCallback(async (delUserId: string): Promise<{ success: boolean; error?: string }> => {
     const s = socketRef.current;
-    if (!s) return { success: false, error: 'Non connecté' };
+    if (!s) return { success: false, error: tCommonRef.current('notConnected') };
 
     return new Promise((resolve) => {
       s.emit('admin:deleteUser', { userId: delUserId }, (success, error) => {
@@ -711,7 +808,7 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
     });
   }, []);
 
-  const adminGetActiveRooms = useCallback(async (): Promise<Room[]> => {
+  const adminGetActiveRooms = useCallback(async (): Promise<AdminActiveRoomSummary[]> => {
     const s = socketRef.current;
     if (!s) return [];
 
@@ -728,6 +825,10 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
     setError(null);
   }, []);
 
+  const clearRoomClosedNotice = useCallback(() => {
+    setRoomClosedNotice(null);
+  }, []);
+
   // Les callbacks sont stables (dépendances []) donc seul l'état change le value
   const value = useMemo<SocketContextType>(() => ({
     socket,
@@ -738,6 +839,7 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
     currentUser,
     isPO,
     error,
+    roomClosedNotice,
     createRoom,
     joinRoom,
     checkRoomPassword,
@@ -777,8 +879,9 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
     adminRevokeSession,
     adminGetActiveRooms,
     clearError,
+    clearRoomClosedNotice,
   }), [
-    socket, isConnected, isReconnecting, room, userId, currentUser, isPO, error,
+    socket, isConnected, isReconnecting, room, userId, currentUser, isPO, error, roomClosedNotice,
     createRoom, joinRoom, checkRoomPassword, leaveRoom, transferPO,
     updateRoomSettings, sendEmoji,
     createItem, updateItem, deleteItem, reorderItem, selectItem, setItemFinalScore,
@@ -787,7 +890,7 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
     updateDeck, uploadImage,
     getBacklogItems, createBacklogItem, updateBacklogItem, deleteBacklogItem, reorderBacklogItem, importBacklogItems,
     checkAdminAccess, adminGetAllUsers, adminGetAllSessions, adminGetAllRoomHistory, adminGetAllBacklogs, adminGetStats, adminDeleteUser, adminRevokeSession, adminGetActiveRooms,
-    clearError,
+    clearError, clearRoomClosedNotice,
   ]);
 
   return (

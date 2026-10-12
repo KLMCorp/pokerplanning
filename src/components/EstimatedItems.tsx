@@ -71,10 +71,10 @@ export default function EstimatedItems() {
   // Copier dans le presse-papier
   const handleCopyToClipboard = async () => {
     const text = estimatedItems
-      .map((item) => `- ${item.title}: ${item.finalScore} pts`)
+      .map((item) => `- ${item.title}: ${item.finalScore} ${tCommon('points')}`)
       .join('\n');
 
-    const summary = `Planning Poker - Room ${roomId}\n${'='.repeat(30)}\n\n${text}\n\nTotal: ${totalPoints} points (${estimatedItems.length} items)`;
+    const summary = `Planning Poker - Room ${roomId}\n${'='.repeat(30)}\n\n${text}\n\n${t('clipboardTotal', { points: totalPoints, count: estimatedItems.length })}`;
 
     const success = await copyToClipboard(summary);
     if (success) {

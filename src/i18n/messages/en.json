@@ -32,7 +32,11 @@
     "minutesAgo": "{minutes} min ago",
     "hoursAgo": "{hours}h ago",
     "daysAgo": "{days}d ago",
-    "organizer": "Organizer"
+    "organizer": "Organizer",
+    "notConnected": "Not connected to the server",
+    "roomJoinError": "Error while joining the room",
+    "sessionExpiredRelogin": "Your session has expired. Please log in again.",
+    "avatar": "Avatar"
   },
   "home": {
     "title": "Planning Poker",
@@ -74,6 +78,8 @@
     "connectionError": "Connection error",
     "roomLabel": "Room:",
     "roomClosedByPO": "The organizer has left the room. Session ended.",
+    "roomClosedExpired": "The room has expired and was closed.",
+    "roomClosedGeneric": "The room was closed.",
     "resetLayout": "Reset layout",
     "panelTable": "Table",
     "panelCards": "Cards",
@@ -83,7 +89,9 @@
     "panelUsers": "Participants",
     "timeRemaining": "Time remaining before room expires",
     "promoteOrganizer": "Make organizer",
-    "promoteOrganizerConfirm": "Make {name} organizer?"
+    "promoteOrganizerConfirm": "Make {name} organizer?",
+    "finalScore": "Score: {score}",
+    "votesProgress": "{voted} / {total} votes"
   },
   "auth": {
     "login": "Login",
@@ -171,7 +179,8 @@
     "playAgain": "Play again",
     "nextItem": "Next item",
     "settings": "Settings",
-    "allowEmojis": "Allow emojis"
+    "allowEmojis": "Allow emojis",
+    "customizeCards": "Customize cards"
   },
   "cardPicker": {
     "chooseCard": "Choose your card",
@@ -204,7 +213,8 @@
     "csvScore": "Score",
     "csvTotal": "Total",
     "csvItems": "items",
-    "csvPoints": "points"
+    "csvPoints": "points",
+    "clipboardTotal": "Total: {points} points ({count} items)"
   },
   "backlog": {
     "title": "My Backlog",
@@ -289,7 +299,11 @@
     "roomTtlLabel": "Lifetime",
     "roomTtlMax": "Max: {hours}h",
     "roomTtlCurrent": "Current",
-    "roomTtlNote": "This setting applies to new rooms you create. Existing rooms are not affected."
+    "roomTtlNote": "This setting applies to new rooms you create. Existing rooms are not affected.",
+    "upload": "Upload",
+    "minutesShort": "{minutes} min",
+    "hoursShort": "{hours}h",
+    "hoursMinutesShort": "{hours}h {minutes}min"
   },
   "profile": {
     "roomHistory": "Room history",
@@ -417,6 +431,47 @@
     "expired": "Expired",
     "stateVoting": "Voting",
     "stateRevealed": "Revealed",
-    "stateIdle": "Idle"
+    "stateIdle": "Idle",
+    "durationHoursMinutes": "{hours}h {minutes}min",
+    "durationMinutes": "{minutes}min"
+  },
+  "card": {
+    "backAlt": "Card back"
+  },
+  "emojiPicker": {
+    "sendTo": "Send to <highlight>{name}</highlight>"
+  },
+  "deckSettings": {
+    "title": "Room cards",
+    "cardBack": "Card back (shared by everyone)",
+    "cardFront": "Card fronts",
+    "noImage": "No image",
+    "changeImage": "Change image",
+    "upload": "Upload",
+    "uploading": "Uploading...",
+    "remove": "Remove",
+    "instructions": "Instructions",
+    "acceptedFormats": "Accepted formats: PNG, JPG, WEBP",
+    "maxSize": "Maximum size: 2 MB per image",
+    "sharedWithAll": "Images are visible to all participants of this room",
+    "backOverridesUsers": "If a back is set here, it replaces each participant's personal card back.",
+    "unsupportedFormat": "Format not supported. Use PNG, JPG or WEBP.",
+    "imageTooLarge": "Image must not exceed 2 MB.",
+    "uploadError": "Error while uploading the image",
+    "backAlt": "Card back"
+  },
+  "cardDescriptions": {
+    "v0": "Not even an effort",
+    "v1": "One coffee and it's done",
+    "v2": "A tiny side quest",
+    "v3": "Nothing too scary",
+    "v5": "Starting to show",
+    "v8": "A small epic",
+    "v13": "That stings a bit",
+    "v20": "A big bite to swallow",
+    "v40": "A big project within the project",
+    "v100": "Strength and honor",
+    "unknown": "I don't know",
+    "coffee": "Need a break"
   }
 }

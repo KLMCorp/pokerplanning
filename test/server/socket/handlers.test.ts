@@ -40,6 +40,8 @@ function disconnectClient(client: TypedClientSocket): Promise<void> {
 
 describe('Socket.IO Handlers', () => {
   beforeAll(async () => {
+    // Plus de 10 créations de room depuis la même IP : on relève le rate limit de room:create
+    process.env.ROOM_CREATE_RATE_LIMIT_PER_MINUTE = '1000';
     httpServer = createServer();
     ioServer = new Server(httpServer, {
       cors: { origin: '*' },

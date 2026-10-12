@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { getCardBackUrl, getCardLogoUrl, isSpecialCard, getRandomCardBackUrl } from '../../src/lib/cardImages';
+import { getCardBackUrl, getCardLogoUrl, isSpecialCard, getRandomCardBackUrl, resolveCardBackUrl } from '../../src/lib/cardImages';
 
 describe('cardImages', () => {
   describe('getCardBackUrl', () => {
@@ -82,6 +82,26 @@ describe('cardImages', () => {
       expect(isSpecialCard('5')).toBe(false);
       expect(isSpecialCard('13')).toBe(false);
       expect(isSpecialCard('0')).toBe(false);
+    });
+  });
+
+  describe('resolveCardBackUrl', () => {
+    it('le dos de la room prime sur le dos utilisateur', () => {
+      expect(resolveCardBackUrl('/room.png', '/user.png')).toBe('/room.png');
+    });
+
+    it('retombe sur le dos utilisateur sans dos de room', () => {
+      expect(resolveCardBackUrl(undefined, '/user.png')).toBe('/user.png');
+      expect(resolveCardBackUrl('', '/user.png')).toBe('/user.png');
+    });
+
+    it('retourne le dos de la room sans dos utilisateur', () => {
+      expect(resolveCardBackUrl('/room.png', undefined)).toBe('/room.png');
+    });
+
+    it('retourne undefined sans aucun dos', () => {
+      expect(resolveCardBackUrl(undefined, undefined)).toBeUndefined();
+      expect(resolveCardBackUrl('', '')).toBeUndefined();
     });
   });
 });

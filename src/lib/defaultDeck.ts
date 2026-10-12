@@ -74,6 +74,20 @@ export function getCardDescription(value: string): string | undefined {
   return CARD_DESCRIPTIONS[value];
 }
 
+/** Valeurs numériques du deck par défaut (clés `cardDescriptions.v<valeur>`) */
+const NUMERIC_DESCRIPTION_VALUES = new Set(['0', '1', '2', '3', '5', '8', '13', '20', '40', '100']);
+
+/**
+ * Clé i18n (namespace `cardDescriptions`) de la description d'une carte,
+ * ou undefined si la carte n'a pas de description.
+ */
+export function getCardDescriptionKey(value: string): string | undefined {
+  if (NUMERIC_DESCRIPTION_VALUES.has(value)) return `v${value}`;
+  if (value === '?') return 'unknown';
+  if (value === 'coffee') return 'coffee';
+  return undefined;
+}
+
 /**
  * Récupère le style d'une carte (fond + couleur texte)
  */

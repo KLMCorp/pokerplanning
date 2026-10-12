@@ -26,63 +26,70 @@ interface LocaleProviderProps {
 export function LocaleProvider({ children }: LocaleProviderProps) {
   const [locale, setLocaleState] = useState<Locale>('fr');
   const [messages, setMessages] = useState<Record<string, unknown> | null>(null);
-  const [isLoading, setIsLoading] = useState(true);
+  const [timeZone, setTimeZone] = useState<string | undefined>(undefined);
 
   // Cache des messages chargés pour éviter les re-fetches
   const messagesCacheRef = useRef<Map<string, Record<string, unknown>>>(new Map());
+  // Identifiant de la dernière requête : les réponses obsolètes sont ignorées
+  const requestIdRef = useRef(0);
 
-  const loadMessages = useCallback(async (loc: Locale) => {
+  const applyLocale = useCallback(async (loc: Locale) => {
+    const id = ++requestIdRef.current;
+
     // Utiliser le cache si disponible
     const cached = messagesCacheRef.current.get(loc);
     if (cached) {
+      setLocaleState(loc);
       setMessages(cached);
-      setIsLoading(false);
       return;
     }
 
-    setIsLoading(true);
+    let loaded: Record<string, unknown>;
+    let effective: Locale = loc;
     try {
-      const loadedMessages = (await import(`@/i18n/messages/${loc}.json`)).default;
-      messagesCacheRef.current.set(loc, loadedMessages);
-      setMessages(loadedMessages);
+      loaded = (await import(`@/i18n/messages/${loc}.json`)).default;
     } catch (error) {
       console.error('Failed to load messages:', error);
       // Fallback to French
-      const fallbackMessages = (await import('@/i18n/messages/fr.json')).default;
-      messagesCacheRef.current.set('fr', fallbackMessages);
-      setMessages(fallbackMessages);
-    } finally {
-      setIsLoading(false);
+      loaded = (await import('@/i18n/messages/fr.json')).default;
+      effective = 'fr';
     }
+    if (id !== requestIdRef.current) return; // réponse obsolète
+    messagesCacheRef.current.set(effective, loaded);
+    // locale et messages sont mis à jour ensemble
+    setLocaleState(effective);
+    setMessages(loaded);
   }, []);
 
   // Load initial locale on mount
   useEffect(() => {
-    const initialLocale = getInitialLocale();
-    setLocaleState(initialLocale);
-    loadMessages(initialLocale);
-  }, [loadMessages]);
+    setTimeZone(Intl.DateTimeFormat().resolvedOptions().timeZone);
+    void applyLocale(getInitialLocale());
+  }, [applyLocale]);
+
+  useEffect(() => {
+    document.documentElement.lang = locale;
+  }, [locale]);
 
   const setLocale = useCallback((newLocale: Locale) => {
     setStoredLocale(newLocale);
-    setLocaleState(newLocale);
-    loadMessages(newLocale);
-  }, [loadMessages]);
+    void applyLocale(newLocale);
+  }, [applyLocale]);
 
   const contextValue = useMemo(() => ({ locale, setLocale }), [locale, setLocale]);
 
-  // Show loading state while messages are loading
-  if (isLoading || !messages) {
+  // Le loader n'apparaît qu'au chargement initial (l'arbre reste monté ensuite)
+  if (!messages) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-gray-50 dark:bg-gray-900">
-        <div className="text-gray-900 dark:text-white">Loading...</div>
+      <div className="min-h-screen flex items-center justify-center bg-gray-50 dark:bg-gray-900" aria-busy="true">
+        <div className="w-10 h-10 border-4 border-poker-gold border-t-transparent rounded-full animate-spin" />
       </div>
     );
   }
 
   return (
     <LocaleContext.Provider value={contextValue}>
-      <NextIntlClientProvider locale={locale} messages={messages}>
+      <NextIntlClientProvider locale={locale} messages={messages} timeZone={timeZone}>
         {children}
       </NextIntlClientProvider>
     </LocaleContext.Provider>

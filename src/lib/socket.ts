@@ -4,37 +4,36 @@
 
 import { io, Socket } from 'socket.io-client';
 import { ClientToServerEvents, ServerToClientEvents } from '@/types';
+import { normalizeSocketUrl, resolveSocketUrl } from './runtimeConfig';
 
 // Instance singleton du socket
 let socket: Socket<ServerToClientEvents, ClientToServerEvents> | null = null;
+// URL avec laquelle le singleton a été créé
+let socketUrl: string | null = null;
 
 /**
- * Détermine l'URL du serveur Socket.IO
- * - En production avec Nginx : utilise la même origine (Nginx proxy /socket.io/)
- * - En développement : utilise localhost:3001
+ * Récupère ou crée l'instance du socket.
+ * L'URL n'est prise en compte qu'à la PREMIÈRE création (singleton) : SocketProvider la résout
+ * (config runtime + heuristique) avant tout autre appel. Sans URL à la création, repli sur la
+ * valeur de build et l'heuristique client.
  */
-function getSocketUrl(): string {
-  if (process.env.NEXT_PUBLIC_SOCKET_URL) {
-    return process.env.NEXT_PUBLIC_SOCKET_URL;
-  }
-  if (typeof window !== 'undefined' && process.env.NODE_ENV === 'production') {
-    return window.location.origin;
-  }
-  return 'http://localhost:3001';
-}
-
-/**
- * Récupère ou crée l'instance du socket
- */
-export function getSocket(): Socket<ServerToClientEvents, ClientToServerEvents> {
+export function getSocket(url?: string): Socket<ServerToClientEvents, ClientToServerEvents> {
   if (!socket) {
-    const url = getSocketUrl();
-    socket = io(url, {
+    socketUrl =
+      url ??
+      resolveSocketUrl(
+        normalizeSocketUrl(process.env.NEXT_PUBLIC_SOCKET_URL),
+        typeof window !== 'undefined' ? window.location : null,
+        process.env.NODE_ENV === 'production',
+      );
+    socket = io(socketUrl, {
       transports: ['websocket'],
       autoConnect: false,
       reconnectionAttempts: 10,
       reconnectionDelayMax: 10000,
     });
+  } else if (url && url !== socketUrl && process.env.NODE_ENV !== 'production') {
+    console.warn(`[socket] URL ${url} ignorée : socket déjà créé pour ${socketUrl}`);
   }
   return socket;
 }

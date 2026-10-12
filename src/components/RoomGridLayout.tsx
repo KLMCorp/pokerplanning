@@ -4,7 +4,8 @@ import React, { useCallback, useRef, useEffect, useState, useMemo } from 'react'
 import { useAuth } from '@/contexts/AuthContext';
 import { useTranslations } from 'next-intl';
 import type { LayoutConfig, RoomPanelId, Room } from '@/types';
-import { DEFAULT_LAYOUT, mergeLayoutWithDefaults } from '@/lib/defaultLayout';
+import { DEFAULT_LAYOUT, mergeLayoutWithDefaults, getRowGridClass } from '@/lib/defaultLayout';
+import { PANEL_DRAG_MIME, isPanelDrag } from '@/lib/panelDrag';
 import GridPanel, { type DropZone } from './GridPanel';
 import PokerTable from './PokerTable';
 import CardPicker from './CardPicker';
@@ -132,15 +133,19 @@ export default function RoomGridLayout({ isPO, room }: RoomGridLayoutProps) {
   }, []);
 
   const handleDragStart = useCallback((panelId: RoomPanelId, e: React.DragEvent) => {
+    // Ignore les dragstart remontés d'un élément interne (ex. item de la liste)
+    if (e.target !== e.currentTarget) return;
     setDraggedPanel(panelId);
     e.dataTransfer.effectAllowed = 'move';
     e.dataTransfer.setData('text/plain', panelId);
+    e.dataTransfer.setData(PANEL_DRAG_MIME, panelId);
     if (e.currentTarget instanceof HTMLElement) {
       e.currentTarget.style.opacity = '0.4';
     }
   }, []);
 
   const handleDragEnd = useCallback((e: React.DragEvent) => {
+    if (e.target !== e.currentTarget) return;
     if (e.currentTarget instanceof HTMLElement) {
       e.currentTarget.style.opacity = '1';
     }
@@ -187,6 +192,7 @@ export default function RoomGridLayout({ isPO, room }: RoomGridLayoutProps) {
   }, [draggedPanel, maxPerRow, saveLayout]);
 
   const handleDropOnBottom = useCallback((e: React.DragEvent) => {
+    if (!isPanelDrag(e.dataTransfer.types)) return;
     e.preventDefault();
     if (!draggedPanel) return;
 
@@ -200,6 +206,7 @@ export default function RoomGridLayout({ isPO, room }: RoomGridLayoutProps) {
   }, [draggedPanel, saveLayout]);
 
   const handleDragOverBottom = useCallback((e: React.DragEvent) => {
+    if (!isPanelDrag(e.dataTransfer.types)) return;
     e.preventDefault();
     e.dataTransfer.dropEffect = 'move';
   }, []);
@@ -294,32 +301,7 @@ export default function RoomGridLayout({ isPO, room }: RoomGridLayoutProps) {
 
       <div className="space-y-3">
         {layout.map((row) => {
-          const hasTable = row.includes('pokerTable');
-          const tableIdx = row.indexOf('pokerTable');
-          let gridClass: string;
-
-          if (row.length === 1) {
-            gridClass = 'grid-cols-1';
-          } else if (row.length === 2) {
-            if (hasTable) {
-              gridClass = tableIdx === 0 ? 'grid-cols-[1fr_320px]' : 'grid-cols-[320px_1fr]';
-            } else {
-              gridClass = 'grid-cols-2';
-            }
-          } else {
-            // 3 panels
-            if (hasTable) {
-              if (tableIdx === 0) {
-                gridClass = 'grid-cols-[1fr_280px_280px]';
-              } else if (tableIdx === 1) {
-                gridClass = 'grid-cols-[280px_1fr_280px]';
-              } else {
-                gridClass = 'grid-cols-[280px_280px_1fr]';
-              }
-            } else {
-              gridClass = 'grid-cols-3';
-            }
-          }
+          const gridClass = getRowGridClass(row);
 
           return (
             <div

@@ -11,14 +11,17 @@ import { useRoom } from '@/hooks/useRoom';
 import { useSocket, useEmojis } from '@/contexts/SocketContext';
 import Card from './Card';
 import { MiniAvatar } from './Avatar';
-import { getTablePosition } from '@/lib/utils';
-import { getCardDescription } from '@/lib/defaultDeck';
+import { getTablePosition, computeVoteHalos } from '@/lib/utils';
+import { getCardDescriptionKey } from '@/lib/defaultDeck';
+import { resolveCardBackUrl } from '@/lib/cardImages';
 import EmojiPicker from './EmojiPicker';
 import FlyingEmoji from './FlyingEmoji';
 import Chronometer from './Chronometer';
 
 export default React.memo(function PokerTable() {
   const t = useTranslations('room');
+  const tCommon = useTranslations('common');
+  const tCards = useTranslations('cardDescriptions');
   const { activeItem, votingUsers, isRevealed, deck, roomState, tableConfig, settings, isPO, transferPO, timerDuration, timerStartedAt, timerStoppedRemaining, isTimerRunning } = useRoom();
   const { sendEmoji, userId } = useSocket();
   const flyingEmojis = useEmojis();
@@ -117,6 +120,11 @@ export default React.memo(function PokerTable() {
   // Compteur de votes memoizé
   const voteCount = useMemo(() => votingUsers.filter(u => u.hasVoted).length, [votingUsers]);
 
+  const voteHalos = useMemo(
+    () => computeVoteHalos(votingUsers, isRevealed),
+    [votingUsers, isRevealed]
+  );
+
   return (
     <div className="relative w-full aspect-[3/2] max-w-5xl 2xl:max-w-6xl mx-auto">
       {/* Table de poker */}
@@ -181,7 +189,7 @@ export default React.memo(function PokerTable() {
               {activeItem.finalScore && (
                 <div className="mt-3">
                   <span className="inline-block px-4 py-2 bg-green-600 text-white rounded-full font-bold text-lg shadow-lg">
-                    Score: {activeItem.finalScore}
+                    {t('finalScore', { score: activeItem.finalScore })}
                   </span>
                 </div>
               )}
@@ -214,6 +222,8 @@ export default React.memo(function PokerTable() {
           const cardConfig = vote && deck?.cards.find((c: { value: string }) => c.value === vote.value);
           const isSelected = selectedUserId === user.id;
           const isMe = user.id === userId;
+          // Ancrage du menu selon la position du joueur (évite de sortir de l'écran sur mobile)
+          const menuAlign: 'start' | 'center' | 'end' = position.x < tableWidth * 0.3 ? 'start' : position.x > tableWidth * 0.7 ? 'end' : 'center';
 
           // Position ajustée pour centrer la carte
           const cardStyle: React.CSSProperties = {
@@ -257,7 +267,7 @@ export default React.memo(function PokerTable() {
               {/* Menu actions (transfert PO + emoji picker) */}
               {isSelected && selectedUser && (isPO || settings?.emojisEnabled !== false) && (
                 <div
-                  className={`absolute left-1/2 -translate-x-1/2 z-50 flex flex-col items-center gap-1 ${
+                  className={`absolute ${menuAlign === 'start' ? 'left-0 items-start' : menuAlign === 'end' ? 'right-0 items-end' : 'left-1/2 -translate-x-1/2 items-center'} z-50 flex flex-col gap-1 ${
                     position.y < tableHeight * 0.4 ? 'top-full mt-1' : 'bottom-full mb-1'
                   }`}
                 >
@@ -273,10 +283,11 @@ export default React.memo(function PokerTable() {
                             onClick={handleConfirmTransfer}
                             className="px-3 py-1 text-xs bg-poker-gold text-gray-900 rounded-md font-medium hover:bg-yellow-400 transition-colors"
                           >
-                            OK
+                            {tCommon('ok')}
                           </button>
                           <button
                             onClick={() => setConfirmTransferUserId(null)}
+                            aria-label={tCommon('cancel')}
                             className="px-3 py-1 text-xs bg-gray-200 dark:bg-gray-700 text-gray-700 dark:text-gray-300 rounded-md hover:bg-gray-300 dark:hover:bg-gray-600 transition-colors"
                           >
                             ✕
@@ -301,6 +312,7 @@ export default React.memo(function PokerTable() {
                       onSelect={handleSendEmoji}
                       onClose={() => { setSelectedUserId(null); setConfirmTransferUserId(null); }}
                       position={position.y < tableHeight * 0.4 ? 'below' : 'above'}
+                      align={menuAlign}
                     />
                   )}
                 </div>
@@ -312,14 +324,15 @@ export default React.memo(function PokerTable() {
                   <Card
                     card={cardConfig}
                     isRevealed={isRevealed}
-                    backImageUrl={user.cardBackUrl}
+                    backImageUrl={resolveCardBackUrl(deck?.backImageUrl, user.cardBackUrl)}
                     cardColor={user.cardColor}
                     size="md"
+                    haloType={voteHalos[user.id]}
                   />
                   {/* Tooltip avec description (uniquement si révélé) */}
-                  {isRevealed && getCardDescription(cardConfig.value) && (
+                  {isRevealed && getCardDescriptionKey(cardConfig.value) && (
                     <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-3 py-1.5 bg-gray-900 dark:bg-gray-700 text-white text-xs rounded-lg opacity-0 group-hover/card:opacity-100 transition-opacity duration-200 pointer-events-none whitespace-nowrap z-50 shadow-lg">
-                      {getCardDescription(cardConfig.value)}
+                      {tCards(getCardDescriptionKey(cardConfig.value) as never)}
                       <div className="absolute top-full left-1/2 -translate-x-1/2 border-4 border-transparent border-t-gray-900 dark:border-t-gray-700" />
                     </div>
                   )}
@@ -331,7 +344,7 @@ export default React.memo(function PokerTable() {
                     card={{ value: 'hidden', label: '?' }}
                     isBack
                     noFlip
-                    backImageUrl={user.cardBackUrl}
+                    backImageUrl={resolveCardBackUrl(deck?.backImageUrl, user.cardBackUrl)}
                     cardColor={user.cardColor}
                     size="md"
                   />
@@ -372,7 +385,7 @@ export default React.memo(function PokerTable() {
         <div className="absolute bottom-0 left-1/2 transform -translate-x-1/2 translate-y-1/2">
           <div className="bg-white dark:bg-gray-800 px-4 py-2 rounded-full shadow-lg border border-gray-200 dark:border-gray-700">
             <span className="text-sm text-gray-700 dark:text-gray-300">
-              {voteCount} / {votingUsers.length} votes
+              {t('votesProgress', { voted: voteCount, total: votingUsers.length })}
             </span>
           </div>
         </div>

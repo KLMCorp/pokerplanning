@@ -63,6 +63,7 @@ export default function RoomPage() {
   const t = useTranslations('room');
   const tJoinRoom = useTranslations('joinRoom');
   const tCommon = useTranslations('common');
+  const tAccount = useTranslations('account');
   const { room, isConnected, isReconnecting, error, joinRoom, checkRoomPassword, leaveRoom } = useSocket();
   const { isPO, currentUser, roomId: connectedRoomId } = useRoom();
   const { account, isAuthenticated } = useAuth();
@@ -253,10 +254,10 @@ export default function RoomPage() {
 
   // Interface principale de la room
   return (
-    <div className="min-h-screen flex flex-col">
+    <div className="min-h-screen flex flex-col overflow-x-clip">
       {/* Header */}
       <header className="bg-white/80 dark:bg-gray-900/80 backdrop-blur-sm border-b border-gray-200 dark:border-gray-800 px-4 py-2 relative z-[100]">
-        <div className="max-w-7xl 2xl:max-w-[1800px] mx-auto flex items-center justify-between">
+        <div className="max-w-7xl 2xl:max-w-[1800px] mx-auto flex flex-wrap gap-2 items-center justify-between">
           {/* Logo et code room */}
           <div className="flex items-center gap-3">
             <h1 className="text-xl font-bold">
@@ -274,7 +275,7 @@ export default function RoomPage() {
               <button
                 onClick={handleCopyLink}
                 className="p-1 text-gray-400 hover:text-gray-600 dark:hover:text-white transition-colors"
-                title="Copier le lien"
+                title={t('copyLink')}
               >
                 {copied ? (
                   <svg className="w-4 h-4 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -299,7 +300,7 @@ export default function RoomPage() {
               <div
                 onClick={() => isAuthenticated && router.push('/account')}
                 className={isAuthenticated ? 'cursor-pointer hover:opacity-80 transition-opacity' : ''}
-                title={isAuthenticated ? 'Mon compte' : undefined}
+                title={isAuthenticated ? tAccount('myAccount') : undefined}
               >
                 <Avatar
                   userId={currentUser.id}

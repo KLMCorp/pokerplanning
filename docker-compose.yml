@@ -5,7 +5,8 @@
 # l'application. Pas de reverse proxy (Traefik, Nginx, etc.).
 #
 # Usage :
-#   1. Copier .env.example en .env et configurer les variables
+#   1. Copier .env.example en .env et configurer les variables (GIT_REPO obligatoire, GIT_BRANCH défaut main :
+#      le Dockerfile clone le dépôt ; pour un build local, utiliser Dockerfile.local)
 #   2. docker compose -f docker-compose.yml up -d --build
 #
 # Rebuild après mise à jour du code :
@@ -19,14 +20,18 @@ services:
       dockerfile: Dockerfile
       args:
         - GIT_REPO=${GIT_REPO:-https://your-git-server/PlanningPoker.git}
-        - GIT_BRANCH=${GIT_BRANCH:-latest}
-        # --- Build Next.js (inlinés dans le bundle client) ---
-        - NEXT_PUBLIC_SOCKET_URL=${NEXT_PUBLIC_SOCKET_URL:-http://localhost:3001}
+        - GIT_BRANCH=${GIT_BRANCH:-main}
+        # --- Build Next.js (valeurs figées par next build) ---
         - NEXT_PUBLIC_CARDS_PATH=${NEXT_PUBLIC_CARDS_PATH:-/images/cartes}
         - APP_VERSION=${APP_VERSION:-1.0.0}
-        - ALLOW_UPLOADS=${ALLOW_UPLOADS:-true}
+        # URL interne utilisée par Next pour servir /uploads sans nginx (figée au build)
+        - UPLOADS_UPSTREAM_URL=${UPLOADS_UPSTREAM_URL:-http://127.0.0.1:3001}
+        # Chemin secret admin : figé au build (rebuild nécessaire pour le changer), visible dans `docker history`
+        - ADMIN_SECRET_PATH=${ADMIN_SECRET_PATH:-}
     container_name: poker-planning
     restart: unless-stopped
+    # Marge au-dessus du délai interne de l'entrypoint (7 s) avant SIGKILL
+    stop_grace_period: 15s
     security_opt:
       - no-new-privileges:true
     ports:
@@ -38,6 +43,13 @@ services:
       - APP_URL=${APP_URL:-http://localhost:3000}
       - PORT=3001
       - CORS_ORIGINS=${CORS_ORIGINS:-}
+      # URL Socket.IO vue par les navigateurs (ex. http://192.168.1.10:3001), lue au lancement.
+      # Vide : même hôte que la page et port 3001 (valable si HOST_PORT_WEB=3000 et HOST_PORT_WS=3001,
+      # sinon la renseigner). Derrière un reverse proxy servi sur le port 3000 en http :
+      # renseigner l'origine de la page.
+      - SOCKET_URL=${SOCKET_URL:-}
+      # Ancien nom (compatibilité) : recopié dans SOCKET_URL par l'entrypoint si celle-ci est vide
+      - NEXT_PUBLIC_SOCKET_URL=${NEXT_PUBLIC_SOCKET_URL:-}
 
       # --- SMTP (optionnel) ---
       - SMTP_HOST=${SMTP_HOST:-}
@@ -49,26 +61,34 @@ services:
 
       # --- Données ---
       - DATA_DIR=/app/data
-      - NEXT_PUBLIC_SOCKET_URL=${NEXT_PUBLIC_SOCKET_URL:-http://localhost:3001}
       - NEXT_PUBLIC_CARDS_PATH=${NEXT_PUBLIC_CARDS_PATH:-/images/cartes}
 
       # --- Limites ---
       - MAX_PARTICIPANTS_PER_ROOM=${MAX_PARTICIPANTS_PER_ROOM:-0}
       - ROOM_TTL_MINUTES=${ROOM_TTL_MINUTES:-180}
-      - ALLOW_UPLOADS=${ALLOW_UPLOADS:-true}
+      - ALLOW_UPLOADS=${ALLOW_UPLOADS:-true}  # lu au lancement par le serveur et l'interface
+
+      # --- Réseau / limites (0 = illimité pour MAX_WS_CONNECTIONS_PER_IP, ROOM_CREATE_RATE_LIMIT_PER_MINUTE, MAX_ACTIVE_ROOMS) ---
+      - TRUST_PROXY=${TRUST_PROXY:-0}
+      - MAX_WS_CONNECTIONS_PER_IP=${MAX_WS_CONNECTIONS_PER_IP:-20}
+      - ROOM_CREATE_RATE_LIMIT_PER_MINUTE=${ROOM_CREATE_RATE_LIMIT_PER_MINUTE:-10}
+      - MAX_ACTIVE_ROOMS=${MAX_ACTIVE_ROOMS:-0}
+      - RECONNECT_GRACE_PERIOD_MS=${RECONNECT_GRACE_PERIOD_MS:-30000}
 
       # --- Administration ---
+      # ⚠️ Le premier compte inscrit avec cet email devient admin (adresse non vérifiée) :
+      # le créer dès le premier déploiement, avant toute exposition publique.
       - ADMIN_EMAIL=${ADMIN_EMAIL:-}
-      - ADMIN_SECRET_PATH=${ADMIN_SECRET_PATH:-}
+      - ADMIN_SECRET_PATH=${ADMIN_SECRET_PATH:-}  # aussi passé en build arg (valeur figée au build)
     volumes:
       - poker-data:/app/data
       - poker-uploads:/app/public/uploads
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3001/health"]
+      test: ["CMD-SHELL", "wget -q -T 3 --spider http://127.0.0.1:3001/health && wget -q -T 3 --spider http://127.0.0.1:3000/"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 15s
+      start_period: 20s
 
 volumes:
   poker-data:

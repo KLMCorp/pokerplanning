@@ -1,0 +1,50 @@
+# =============================================================================
+# Build & validation sur push main
+# =============================================================================
+# Vérifie que le code compile, passe les tests et que l'image Docker se build.
+# Ne publie rien — voir release.yml pour la publication.
+
+name: Build
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 24
+        cache: npm
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Check TypeScript 7
+      run: npx tsc -v | grep -q "Version 7"
+
+    - name: Lint
+      run: npm run lint
+
+    - name: Type check
+      run: npm run typecheck
+
+    - name: Tests
+      run: npm run test:run
+
+    - name: Build
+      run: npm run build
+
+  docker:
+    name: Docker build check
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Build Docker image
+      run: docker build -f Dockerfile.local -t poker-planning:ci --build-arg APP_VERSION=${{ github.sha }} .

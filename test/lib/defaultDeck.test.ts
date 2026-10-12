@@ -1,9 +1,11 @@
 import { describe, it, expect } from 'vitest';
+import frMessages from '../../src/i18n/messages/fr.json';
 import {
   DEFAULT_DECK,
   CARD_STYLES,
   CARD_DESCRIPTIONS,
   getCardDescription,
+  getCardDescriptionKey,
   getCardStyle,
   getCardColor,
 } from '../../src/lib/defaultDeck';
@@ -142,6 +144,27 @@ describe('defaultDeck', () => {
 
     it('devrait retourner la classe bg par défaut pour une valeur inconnue', () => {
       expect(getCardColor('invalid')).toBe('bg-gray-100');
+    });
+  });
+
+  describe('getCardDescriptionKey', () => {
+    it('retourne une clé existante dans cardDescriptions pour chaque carte du deck par défaut', () => {
+      for (const card of DEFAULT_DECK.cards) {
+        const key = getCardDescriptionKey(card.value);
+        expect(key, card.value).toBeDefined();
+        expect(Object.hasOwn(frMessages.cardDescriptions, key as string), `${card.value} → ${key}`).toBe(true);
+      }
+    });
+
+    it('mappe les valeurs spéciales', () => {
+      expect(getCardDescriptionKey('0')).toBe('v0');
+      expect(getCardDescriptionKey('100')).toBe('v100');
+      expect(getCardDescriptionKey('?')).toBe('unknown');
+      expect(getCardDescriptionKey('coffee')).toBe('coffee');
+    });
+
+    it('retourne undefined pour une valeur inconnue', () => {
+      expect(getCardDescriptionKey('4')).toBeUndefined();
     });
   });
 });

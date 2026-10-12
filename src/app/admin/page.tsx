@@ -6,12 +6,12 @@
 
 import { useEffect, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
-import { useTranslations } from 'next-intl';
+import { useTranslations, useFormatter } from 'next-intl';
 import { useAuth } from '@/contexts/AuthContext';
 import { useSocket } from '@/contexts/SocketContext';
 import ThemeToggle from '@/components/ThemeToggle';
 import LanguageToggle from '@/components/LanguageToggle';
-import { AdminStats, AdminUserAccount, SessionInfo, RoomHistory, BacklogItem, Room } from '@/types';
+import { AdminStats, AdminUserAccount, SessionInfo, RoomHistory, BacklogItem, AdminActiveRoomSummary } from '@/types';
 
 type Tab = 'users' | 'sessions' | 'activeRooms' | 'rooms' | 'backlogs';
 
@@ -26,6 +26,7 @@ export default function AdminPage() {
   const router = useRouter();
   const t = useTranslations('admin');
   const tCommon = useTranslations('common');
+  const format = useFormatter();
   const { isAuthenticated, isLoading: authLoading, isServerConnected, logout } = useAuth();
   const {
     isConnected,
@@ -47,7 +48,7 @@ export default function AdminPage() {
   const [users, setUsers] = useState<AdminUserAccount[]>([]);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [roomHistories, setRoomHistories] = useState<RoomHistory[]>([]);
-  const [activeRooms, setActiveRooms] = useState<Room[]>([]);
+  const [activeRooms, setActiveRooms] = useState<AdminActiveRoomSummary[]>([]);
   const [backlogs, setBacklogs] = useState<BacklogGroup[]>([]);
   const [loading, setLoading] = useState(true);
   const [expandedRooms, setExpandedRooms] = useState<Set<string>>(new Set());
@@ -160,7 +161,7 @@ export default function AdminPage() {
   };
 
   const formatDate = (timestamp: number) => {
-    return new Date(timestamp).toLocaleString();
+    return format.dateTime(new Date(timestamp), { dateStyle: 'short', timeStyle: 'short' });
   };
 
   if (authLoading || !isConnected || !isServerConnected || checkingAccess) {
@@ -368,7 +369,7 @@ export default function AdminPage() {
                       <tbody>
                         {sessions.map((session) => (
                           <tr key={session.token} className="border-b border-gray-100 dark:border-gray-700/50 hover:bg-gray-50 dark:hover:bg-gray-700/30">
-                            <td className="py-2 px-3 font-mono text-xs text-gray-600 dark:text-gray-400">{session.token.slice(0, 8)}...{session.token.slice(-4)}</td>
+                            <td className="py-2 px-3 font-mono text-xs text-gray-600 dark:text-gray-400">{session.token}</td>
                             <td className="py-2 px-3">
                               <div className="text-gray-900 dark:text-white">{session.userName}</div>
                               <div className="text-xs text-gray-500 dark:text-gray-400">{session.userEmail ? `${session.userEmail.split('@')[0].slice(0, 3)}***@${session.userEmail.split('@')[1] || ''}` : '-'}</div>
@@ -429,9 +430,9 @@ export default function AdminPage() {
                         const hours = Math.floor(ms / (1000 * 60 * 60));
                         const minutes = Math.floor((ms % (1000 * 60 * 60)) / (1000 * 60));
                         if (hours > 0) {
-                          return `${hours}h ${minutes}min`;
+                          return t('durationHoursMinutes', { hours, minutes });
                         }
-                        return `${minutes}min`;
+                        return t('durationMinutes', { minutes });
                       };
 
                       return (
@@ -445,10 +446,10 @@ export default function AdminPage() {
                                 {room.id}
                               </span>
                               <span className="text-gray-900 dark:text-white font-medium">
-                                {room.users[room.poUserId]?.name || t('unknownPO')}
+                                {room.poName ?? t('unknownPO')}
                               </span>
                               <span className="text-sm text-gray-500 dark:text-gray-400">
-                                {Object.keys(room.users).length} {t('participants')}
+                                {room.userCount} {t('participants')}
                               </span>
                             </div>
                             <div className="flex items-center gap-3">
@@ -487,7 +488,7 @@ export default function AdminPage() {
                             </div>
                             <div>
                               <div className="text-gray-500 dark:text-gray-400 text-xs mb-1">{t('itemsCount')}</div>
-                              <div className="text-gray-900 dark:text-white">{room.items.length} items</div>
+                              <div className="text-gray-900 dark:text-white">{tCommon('items', { count: room.itemCount })}</div>
                             </div>
                           </div>
 
@@ -495,16 +496,16 @@ export default function AdminPage() {
                           <div className="mt-3 pt-3 border-t border-gray-100 dark:border-gray-700">
                             <div className="text-gray-500 dark:text-gray-400 text-xs mb-2">{t('participants')}:</div>
                             <div className="flex flex-wrap gap-2">
-                              {Object.values(room.users).map((user) => (
+                              {room.participants.map((p) => (
                                 <span
-                                  key={user.id}
+                                  key={p.id}
                                   className={`px-2 py-0.5 text-xs rounded ${
-                                    user.id === room.poUserId
+                                    p.isPO
                                       ? 'bg-purple-100 dark:bg-purple-900/50 text-purple-700 dark:text-purple-300'
                                       : 'bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-400'
                                   }`}
                                 >
-                                  {user.name} {user.id === room.poUserId && '(PO)'}
+                                  {p.name}{p.isPO && ' (PO)'}
                                 </span>
                               ))}
                             </div>
@@ -542,7 +543,7 @@ export default function AdminPage() {
                             </span>
                             <span className="text-gray-900 dark:text-white">{room.creatorName}</span>
                             <span className="text-xs text-gray-500 dark:text-gray-400">
-                              {room.participantCount} {t('participants')} | {room.items.length} items
+                              {room.participantCount} {t('participants')} | {tCommon('items', { count: room.items.length })}
                             </span>
                           </div>
                           <div className="flex items-center gap-3">
@@ -620,7 +621,7 @@ export default function AdminPage() {
                           </div>
                           <div className="flex items-center gap-3">
                             <span className="text-sm text-gray-600 dark:text-gray-400">
-                              {group.items.length} items
+                              {tCommon('items', { count: group.items.length })}
                             </span>
                             <svg
                               className={`w-4 h-4 text-gray-400 transition-transform ${expandedBacklogs.has(group.userId) ? 'rotate-180' : ''}`}
@@ -650,7 +651,7 @@ export default function AdminPage() {
                                     <td className="py-2 text-center">
                                       {item.estimatedPoints ? (
                                         <span className="px-2 py-0.5 bg-green-100 dark:bg-green-900/50 text-green-700 dark:text-green-300 rounded text-xs">
-                                          {item.estimatedPoints} pts
+                                          {item.estimatedPoints} {tCommon('points')}
                                         </span>
                                       ) : (
                                         <span className="text-gray-400">-</span>

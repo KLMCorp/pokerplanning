@@ -8,6 +8,8 @@ import {
   truncate,
   formatRelativeTime,
   copyToClipboard,
+  computeVoteHalos,
+  deckHasCard,
 } from '../../src/lib/utils';
 
 describe('utils', () => {
@@ -313,5 +315,101 @@ describe('utils', () => {
 
       vi.unstubAllGlobals();
     });
+  });
+
+  describe('computeVoteHalos', () => {
+    it('devrait retourner highest pour le plus grand et lowest pour le plus petit', () => {
+      const users = [
+        { user: { id: 'u1' }, vote: { value: '3', createdAt: 0 } },
+        { user: { id: 'u2' }, vote: { value: '8', createdAt: 0 } },
+        { user: { id: 'u3' }, vote: { value: '5', createdAt: 0 } },
+      ];
+      const halos = computeVoteHalos(users, true);
+      expect(halos['u1']).toBe('lowest');
+      expect(halos['u2']).toBe('highest');
+      expect(halos['u3']).toBeUndefined();
+    });
+
+    it('devrait retourner un objet vide si tous les votes sont identiques', () => {
+      const users = [
+        { user: { id: 'u1' }, vote: { value: '5', createdAt: 0 } },
+        { user: { id: 'u2' }, vote: { value: '5', createdAt: 0 } },
+      ];
+      expect(computeVoteHalos(users, true)).toEqual({});
+    });
+
+    it('devrait ignorer les cartes spéciales (? et coffee)', () => {
+      const users = [
+        { user: { id: 'u1' }, vote: { value: '?', createdAt: 0 } },
+        { user: { id: 'u2' }, vote: { value: 'coffee', createdAt: 0 } },
+        { user: { id: 'u3' }, vote: { value: '8', createdAt: 0 } },
+        { user: { id: 'u4' }, vote: { value: '3', createdAt: 0 } },
+      ];
+      const halos = computeVoteHalos(users, true);
+      expect(halos['u1']).toBeUndefined();
+      expect(halos['u2']).toBeUndefined();
+      expect(halos['u3']).toBe('highest');
+      expect(halos['u4']).toBe('lowest');
+    });
+
+    it('devrait retourner un objet vide si isRevealed est false', () => {
+      const users = [
+        { user: { id: 'u1' }, vote: { value: '3', createdAt: 0 } },
+        { user: { id: 'u2' }, vote: { value: '8', createdAt: 0 } },
+      ];
+      expect(computeVoteHalos(users, false)).toEqual({});
+    });
+
+    it('devrait retourner un objet vide si aucun vote numérique', () => {
+      const users = [
+        { user: { id: 'u1' }, vote: { value: '?', createdAt: 0 } },
+      ];
+      expect(computeVoteHalos(users, true)).toEqual({});
+    });
+
+    it('devrait retourner un objet vide si aucun utilisateur n\'a voté', () => {
+      const users = [
+        { user: { id: 'u1' } },
+        { user: { id: 'u2' } },
+      ];
+      expect(computeVoteHalos(users, true)).toEqual({});
+    });
+
+    it('devrait gérer plusieurs utilisateurs au même max ou même min', () => {
+      const users = [
+        { user: { id: 'u1' }, vote: { value: '8', createdAt: 0 } },
+        { user: { id: 'u2' }, vote: { value: '8', createdAt: 0 } },
+        { user: { id: 'u3' }, vote: { value: '3', createdAt: 0 } },
+        { user: { id: 'u4' }, vote: { value: '3', createdAt: 0 } },
+      ];
+      const halos = computeVoteHalos(users, true);
+      expect(halos['u1']).toBe('highest');
+      expect(halos['u2']).toBe('highest');
+      expect(halos['u3']).toBe('lowest');
+      expect(halos['u4']).toBe('lowest');
+    });
+  });
+});
+
+describe('deckHasCard', () => {
+  const deckWithQuestion = {
+    cards: [
+      { value: '1', label: '1' },
+      { value: '?', label: '?' },
+    ],
+  };
+  const deckWithoutQuestion = { cards: [{ value: '1', label: '1' }, { value: '2', label: '2' }] };
+
+  it('retourne true si le deck contient la carte', () => {
+    expect(deckHasCard(deckWithQuestion, '?')).toBe(true);
+  });
+
+  it('retourne false si le deck ne contient pas la carte', () => {
+    expect(deckHasCard(deckWithoutQuestion, '?')).toBe(false);
+  });
+
+  it('retourne false pour null et undefined', () => {
+    expect(deckHasCard(null, '?')).toBe(false);
+    expect(deckHasCard(undefined, '?')).toBe(false);
   });
 });

@@ -12,6 +12,8 @@ import { useSocket } from '@/contexts/SocketContext';
 import { useConfirm } from './ConfirmDialog';
 import ItemForm from './ItemForm';
 
+const ITEM_DRAG_MIME = 'application/x-pokerplanning-item';
+
 export default function ItemList() {
   const t = useTranslations('itemList');
   const tCommon = useTranslations('common');
@@ -64,23 +66,31 @@ export default function ItemList() {
     setDraggedId(itemId);
   };
 
+  // Sans drag d'item en cours (ex. drag de panneau), ces handlers ne font rien
+  // et laissent l'événement remonter jusqu'au GridPanel.
   const handleDragEnter = (itemId: string) => {
+    if (draggedId === null) return;
     dragCounter.current++;
     if (itemId !== draggedId) setDragOverId(itemId);
   };
 
   const handleDragLeave = () => {
+    if (draggedId === null) return;
     dragCounter.current--;
     if (dragCounter.current === 0) setDragOverId(null);
   };
 
   const handleDragOver = (e: React.DragEvent) => {
+    if (draggedId === null) return;
     e.preventDefault();
+    e.stopPropagation();
   };
 
-  const handleDrop = (targetItemId: string) => {
+  const handleDrop = (e: React.DragEvent, targetItemId: string) => {
+    if (draggedId === null) return;
+    e.stopPropagation();
     dragCounter.current = 0;
-    if (!draggedId || draggedId === targetItemId) {
+    if (draggedId === targetItemId) {
       setDraggedId(null);
       setDragOverId(null);
       return;
@@ -163,11 +173,18 @@ export default function ItemList() {
               <div
                 key={item.id}
                 draggable={isPO}
-                onDragStart={() => isPO && handleDragStart(item.id)}
+                onDragStart={(e) => {
+                  if (!isPO) return;
+                  e.stopPropagation();
+                  e.dataTransfer.effectAllowed = 'move';
+                  // MIME dédié (pas de text/plain : lâcher l'item sur un champ texte y insérerait l'id)
+                  e.dataTransfer.setData(ITEM_DRAG_MIME, item.id);
+                  handleDragStart(item.id);
+                }}
                 onDragEnter={() => isPO && handleDragEnter(item.id)}
                 onDragLeave={() => isPO && handleDragLeave()}
                 onDragOver={isPO ? handleDragOver : undefined}
-                onDrop={() => isPO && handleDrop(item.id)}
+                onDrop={(e) => isPO && handleDrop(e, item.id)}
                 onDragEnd={() => isPO && handleDragEnd()}
                 className={`
                   p-3 rounded-lg border-2 transition-all

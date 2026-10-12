@@ -5,7 +5,9 @@
  */
 
 import React, { createContext, useContext, useEffect, useState, useCallback, useMemo, useRef } from 'react';
+import { useTranslations } from 'next-intl';
 import { useSocket } from './SocketContext';
+import { useToast } from '@/components/Toast';
 import { UserAccount, UserRole, AuthType, RoomHistory, DeckConfig, TableConfig, LayoutConfig } from '@/types';
 
 interface AuthContextType {
@@ -29,8 +31,8 @@ interface AuthContextType {
   updateLayoutConfig: (layoutConfig: LayoutConfig) => Promise<boolean>;
   maxRoomTtlMinutes: number;
   forgotPassword: (email: string) => Promise<{ success: boolean; error?: string }>;
-  verifyResetCode: (code: string) => Promise<{ valid: boolean; error?: string }>;
-  resetPassword: (code: string, newPassword: string) => Promise<{ success: boolean; error?: string }>;
+  verifyResetCode: (email: string, code: string) => Promise<{ valid: boolean; error?: string }>;
+  resetPassword: (email: string, code: string, newPassword: string) => Promise<{ success: boolean; error?: string }>;
 }
 
 const AuthContext = createContext<AuthContextType | null>(null);
@@ -61,6 +63,8 @@ function getDefaultDeckConfig(): DeckConfig {
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const { socket, isConnected } = useSocket();
+  const { showToast } = useToast();
+  const tCommon = useTranslations('common');
   const [account, setAccount] = useState<UserAccount | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isServerConnected, setIsServerConnected] = useState(false);
@@ -71,6 +75,24 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   // Ref stable pour éviter de recréer les callbacks quand socket change
   const socketRef = useRef(socket);
   socketRef.current = socket;
+
+  // Refs synchronisées en effet pour garder des callbacks stables
+  const showToastRef = useRef(showToast);
+  const tCommonRef = useRef(tCommon);
+  useEffect(() => {
+    showToastRef.current = showToast;
+    tCommonRef.current = tCommon;
+  }, [showToast, tCommon]);
+
+  // Efface toute trace locale de la session (compte, historique, tokens)
+  const clearLocalSession = useCallback(() => {
+    setAccount(null);
+    storedAccountRef.current = null;
+    setRoomHistory([]);
+    setIsServerConnected(false);
+    localStorage.removeItem(STORAGE_KEY);
+    localStorage.removeItem(SESSION_TOKEN_KEY);
+  }, []);
 
   // Charger le compte depuis le localStorage au démarrage
   useEffect(() => {
@@ -102,21 +124,24 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       hasReconnected.current = true;
       // Re-associer le socket avec le compte et le token de session
       const sessionToken = localStorage.getItem(SESSION_TOKEN_KEY) || undefined;
-      socket.emit('auth:reconnect', { accountId: storedAccount.id, sessionToken }, (success, serverAccount) => {
+      socket.emit('auth:reconnect', { accountId: storedAccount.id, sessionToken }, (success, serverAccount, reason) => {
         if (success && serverAccount) {
           // Mettre à jour les infos du compte si elles ont changé
           setAccount(serverAccount);
           storedAccountRef.current = serverAccount;
           localStorage.setItem(STORAGE_KEY, JSON.stringify(serverAccount));
           setIsServerConnected(true);
+        } else if (reason === 'invalid_session') {
+          // Rejet explicite du serveur : session invalide, on nettoie tout
+          clearLocalSession();
+          showToastRef.current(tCommonRef.current('sessionExpiredRelogin'), 'error', 6000);
         } else {
-          // Session invalide - nettoyer les données locales
-          setIsServerConnected(false);
-          localStorage.removeItem(SESSION_TOKEN_KEY);
+          // Échec sans raison (erreur serveur transitoire) : on garde la session locale et on réessaiera
+          hasReconnected.current = false;
         }
       });
     }
-  }, [isConnected, socket]);
+  }, [isConnected, socket, clearLocalSession]);
 
   const refreshHistory = useCallback(async () => {
     const s = socketRef.current;
@@ -132,15 +157,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   // Rafraîchir l'historique quand on est connecté
   useEffect(() => {
-    if (isConnected && account) {
+    // Attendre l'association serveur du socket au compte (auth:reconnect), sinon l'historique revient vide
+    if (isConnected && isServerConnected && account) {
       refreshHistory();
     }
-  }, [isConnected, account, refreshHistory]);
+  }, [isConnected, isServerConnected, account, refreshHistory]);
 
   const register = useCallback(
     async (email: string, password: string, name: string, role: UserRole, authType?: AuthType, pseudo?: string): Promise<{ success: boolean; error?: string }> => {
       const s = socketRef.current;
-      if (!s) return { success: false, error: 'Non connecté au serveur' };
+      if (!s) return { success: false, error: tCommonRef.current('notConnected') };
 
       return new Promise((resolve) => {
         s.emit('auth:register', { email, password, name, role, authType, pseudo }, (success, acc, error, sessionToken) => {
@@ -154,7 +180,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             setIsServerConnected(true);
             resolve({ success: true });
           } else {
-            resolve({ success: false, error: error || 'Erreur lors de l\'inscription' });
+            resolve({ success: false, error });
           }
         });
       });
@@ -165,7 +191,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const login = useCallback(
     async (email: string, password: string, authType?: AuthType, pseudo?: string): Promise<{ success: boolean; error?: string }> => {
       const s = socketRef.current;
-      if (!s) return { success: false, error: 'Non connecté au serveur' };
+      if (!s) return { success: false, error: tCommonRef.current('notConnected') };
 
       return new Promise((resolve) => {
         s.emit('auth:login', { email, password, authType, pseudo }, (success, acc, error, sessionToken) => {
@@ -179,7 +205,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             setIsServerConnected(true);
             resolve({ success: true });
           } else {
-            resolve({ success: false, error: error || 'Erreur lors de la connexion' });
+            resolve({ success: false, error });
           }
         });
       });
@@ -193,12 +219,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (s) {
       s.emit('auth:logout', { sessionToken });
     }
-    setAccount(null);
-    setRoomHistory([]);
-    setIsServerConnected(false);
-    localStorage.removeItem(STORAGE_KEY);
-    localStorage.removeItem(SESSION_TOKEN_KEY);
-  }, []);
+    clearLocalSession();
+  }, [clearLocalSession]);
 
   const deleteRoomHistory = useCallback(
     async (historyId: string): Promise<boolean> => {
@@ -439,7 +461,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const updateRoomTtl = useCallback(
     async (ttlMinutes: number): Promise<{ success: boolean; error?: string }> => {
       const s = socketRef.current;
-      if (!s || !storedAccountRef.current) return { success: false, error: 'Non connecté' };
+      if (!s || !storedAccountRef.current) return { success: false, error: tCommonRef.current('notConnected') };
 
       return new Promise((resolve) => {
         s.emit('auth:updateRoomTtl', { ttlMinutes }, (success, error) => {
@@ -485,7 +507,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const forgotPassword = useCallback(
     async (email: string): Promise<{ success: boolean; error?: string }> => {
       const s = socketRef.current;
-      if (!s) return { success: false, error: 'Non connecté au serveur' };
+      if (!s) return { success: false, error: tCommonRef.current('notConnected') };
 
       return new Promise((resolve) => {
         s.emit('auth:forgotPassword', { email }, (success, error) => {
@@ -497,12 +519,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   );
 
   const verifyResetCode = useCallback(
-    async (code: string): Promise<{ valid: boolean; error?: string }> => {
+    async (email: string, code: string): Promise<{ valid: boolean; error?: string }> => {
       const s = socketRef.current;
-      if (!s) return { valid: false, error: 'Non connecté au serveur' };
+      if (!s) return { valid: false, error: tCommonRef.current('notConnected') };
 
       return new Promise((resolve) => {
-        s.emit('auth:verifyResetCode', { code }, (valid, error) => {
+        s.emit('auth:verifyResetCode', { email, code }, (valid, error) => {
           resolve({ valid, error });
         });
       });
@@ -511,12 +533,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   );
 
   const resetPassword = useCallback(
-    async (code: string, newPassword: string): Promise<{ success: boolean; error?: string }> => {
+    async (email: string, code: string, newPassword: string): Promise<{ success: boolean; error?: string }> => {
       const s = socketRef.current;
-      if (!s) return { success: false, error: 'Non connecté au serveur' };
+      if (!s) return { success: false, error: tCommonRef.current('notConnected') };
 
       return new Promise((resolve) => {
-        s.emit('auth:resetPassword', { code, newPassword }, (success, error) => {
+        s.emit('auth:resetPassword', { email, code, newPassword }, (success, error) => {
           resolve({ success, error });
         });
       });

@@ -2,7 +2,7 @@
  * Fonctions utilitaires pour le Planning Poker
  */
 
-import { Vote, VoteStatistics } from '@/types';
+import { Vote, VoteStatistics, DeckConfig } from '@/types';
 
 /**
  * Calcule les statistiques des votes après reveal
@@ -98,6 +98,43 @@ export function isNumericCard(value: string): boolean {
   return value !== '?' && value !== 'coffee' && !isNaN(parseFloat(value));
 }
 
+export type VoteHaloType = 'highest' | 'lowest';
+
+/**
+ * Calcule les halos min/max pour les votes révélés.
+ * Retourne un mapping userId → 'highest' | 'lowest'.
+ * Les cartes spéciales (?, coffee) sont ignorées.
+ * Retourne un objet vide si tous les votes numériques sont identiques.
+ */
+export function computeVoteHalos(
+  votingUsers: Array<{ user: { id: string }; vote?: { value: string } | null }>,
+  isRevealed: boolean
+): Record<string, VoteHaloType> {
+  if (!isRevealed) return {};
+
+  const numericVotes: Array<{ userId: string; numericValue: number }> = [];
+  for (const { user, vote } of votingUsers) {
+    if (vote && isNumericCard(vote.value)) {
+      numericVotes.push({ userId: user.id, numericValue: parseFloat(vote.value) });
+    }
+  }
+
+  if (numericVotes.length === 0) return {};
+
+  const values = numericVotes.map((v) => v.numericValue);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+
+  if (min === max) return {};
+
+  const result: Record<string, VoteHaloType> = {};
+  for (const { userId, numericValue } of numericVotes) {
+    if (numericValue === max) result[userId] = 'highest';
+    else if (numericValue === min) result[userId] = 'lowest';
+  }
+  return result;
+}
+
 /**
  * Génère un identifiant unique simple
  */
@@ -172,4 +209,12 @@ export async function copyToClipboard(text: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/**
+ * Indique si un deck contient une carte de valeur donnée
+ * (un deck personnalisé peut ne pas contenir '?')
+ */
+export function deckHasCard(deck: DeckConfig | null | undefined, value: string): boolean {
+  return !!deck && deck.cards.some((card) => card.value === value);
 }

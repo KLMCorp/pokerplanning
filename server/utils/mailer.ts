@@ -40,6 +40,13 @@ const transporter = isSmtpConfigured
   : null;
 
 /**
+ * Indique si le service email (SMTP) est configuré
+ */
+export function isMailerConfigured(): boolean {
+  return transporter !== null;
+}
+
+/**
  * Envoie un email de réinitialisation de mot de passe
  */
 export async function sendPasswordResetEmail(

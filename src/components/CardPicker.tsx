@@ -9,10 +9,11 @@ import { useCallback, useRef } from 'react';
 import { useTranslations } from 'next-intl';
 import { useRoom } from '@/hooks/useRoom';
 import Card from './Card';
-import { getCardDescription } from '@/lib/defaultDeck';
+import { getCardDescriptionKey } from '@/lib/defaultDeck';
 
 export default function CardPicker() {
   const t = useTranslations('cardPicker');
+  const tCards = useTranslations('cardDescriptions');
   const { deck, myVote, isVoting, vote, hasVoted, currentUser } = useRoom();
 
   // Callbacks stables par carte — évite d'invalider React.memo de Card
@@ -47,7 +48,8 @@ export default function CardPicker() {
       <div className="flex flex-wrap gap-3 justify-center items-end min-h-[120px]">
         {deck.cards.map((card) => {
           const isSelected = myVote?.value === card.value;
-          const description = getCardDescription(card.value);
+          const descriptionKey = getCardDescriptionKey(card.value);
+          const description = descriptionKey ? tCards(descriptionKey as never) : undefined;
 
           return (
             <div

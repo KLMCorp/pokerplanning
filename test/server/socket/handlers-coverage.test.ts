@@ -3,12 +3,14 @@
  * Couvre les chemins d'erreur, validations, handlers auth/backlog/admin,
  * et les scénarios de déconnexion/reconnexion.
  */
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vitest';
 import { createServer, Server as HttpServer } from 'http';
+import * as fs from 'fs';
+import * as path from 'path';
 import { Server } from 'socket.io';
 import { io as ioc, Socket as ClientSocket } from 'socket.io-client';
 import { setupSocketHandlers } from '../../../server/socket/handlers';
-import { ClientToServerEvents, ServerToClientEvents, Room, UserAccount } from '../../../src/types';
+import { ClientToServerEvents, ServerToClientEvents, Room, RoomClosedPayload, AdminActiveRoomSummary, UserAccount } from '../../../src/types';
 
 const TEST_PORT = 3097;
 
@@ -64,8 +66,33 @@ async function joinRoom(client: TypedClientSocket, roomId: string, userName = 'D
   });
 }
 
+/**
+ * Helper : attend un room:updated satisfaisant le prédicat (évite de capter une diffusion sans rapport,
+ * ex. celle d'un vote:cast précédent). L'écoute est posée avant l'émission.
+ */
+function emitAndWaitRoom(client: TypedClientSocket, emit: () => void, predicate: (room: Room) => boolean): Promise<Room> {
+  return new Promise<Room>((resolve) => {
+    const listener = (room: Room) => {
+      if (predicate(room)) {
+        client.off('room:updated', listener);
+        resolve(room);
+      }
+    };
+    client.on('room:updated', listener);
+    emit();
+  });
+}
+
+/** Helper : un vote visible de valeur donnée sur l'item */
+function hasVoteValue(room: Room, itemId: string, value: string): boolean {
+  const item = room.items.find((i) => i.id === itemId);
+  return !!item && Object.values(item.votes).some((v) => v.value === value);
+}
+
 describe('Handlers Coverage', () => {
   beforeAll(async () => {
+    // Plus de 10 créations de room depuis la même IP : on relève le rate limit de room:create
+    process.env.ROOM_CREATE_RATE_LIMIT_PER_MINUTE = '1000';
     process.env.TRUST_PROXY = 'true';
     httpServer = createServer();
     ioServer = new Server(httpServer, {
@@ -315,6 +342,22 @@ describe('Handlers Coverage', () => {
       });
 
       expect(result.success).toBe(false);
+
+      await disconnectClient(client);
+    });
+
+    it("devrait répondre la raison 'invalid_session' pour un token invalide, un id invalide ou un token absent", async () => {
+      const client = createClient();
+      await connectClient(client);
+      const reconnect = (data: unknown) =>
+        new Promise<unknown[]>((resolve) => {
+          (client as unknown as { emit: (ev: string, ...a: unknown[]) => void }).emit('auth:reconnect', data, (...args: unknown[]) => resolve(args));
+        });
+
+      // undefined est sérialisé en null par socket.io (le compte est absent)
+      expect(await reconnect({ accountId: '00000000-0000-0000-0000-000000000000', sessionToken: 'token-invalide' })).toEqual([false, null, 'invalid_session']);
+      expect(await reconnect({ accountId: 'not-a-uuid', sessionToken: 'x' })).toEqual([false, null, 'invalid_session']);
+      expect(await reconnect({ accountId: '00000000-0000-0000-0000-000000000000' })).toEqual([false, null, 'invalid_session']);
 
       await disconnectClient(client);
     });
@@ -664,14 +707,16 @@ describe('Handlers Coverage', () => {
   // ====== AUTH:FORGOTPASSWORD / AUTH:VERIFYRESETCODE / AUTH:RESETPASSWORD ======
 
   describe('auth:forgotPassword', () => {
-    it('devrait retourner true même si l\'email n\'existe pas (anti-énumération)', async () => {
+    it('devrait répondre \'Service email non configuré\' quand SMTP n\'est pas configuré (même email inexistant)', async () => {
+      // En test, SMTP n'est pas configuré : la réponse ne dépend pas de l'existence de l'email
       const client = createClient();
       await connectClient(client);
 
-      const result = await new Promise<{ success: boolean }>((resolve) => {
-        client.emit('auth:forgotPassword', { email: 'nonexistent@test.com' }, (success) => resolve({ success }));
+      const result = await new Promise<{ success: boolean; error?: string }>((resolve) => {
+        client.emit('auth:forgotPassword', { email: 'nonexistent@test.com' }, (success, error) => resolve({ success, error }));
       });
-      expect(result.success).toBe(true);
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('Service email non configuré');
 
       await disconnectClient(client);
     });
@@ -696,9 +741,10 @@ describe('Handlers Coverage', () => {
       await connectClient(client);
 
       const result = await new Promise<{ valid: boolean; error?: string }>((resolve) => {
-        client.emit('auth:verifyResetCode', { code: '000000' }, (valid, error) => resolve({ valid, error }));
+        client.emit('auth:verifyResetCode', { email: 'x@y.z', code: '000000' }, (valid, error) => resolve({ valid, error }));
       });
       expect(result.valid).toBe(false);
+      expect(result.error).toBe('Code invalide ou expiré. Vous pouvez demander un nouveau code.');
 
       await disconnectClient(client);
     });
@@ -710,9 +756,10 @@ describe('Handlers Coverage', () => {
       await connectClient(client);
 
       const result = await new Promise<{ success: boolean; error?: string }>((resolve) => {
-        client.emit('auth:resetPassword', { code: '', newPassword: '' }, (success, error) => resolve({ success, error }));
+        client.emit('auth:resetPassword', { email: '', code: '', newPassword: '' }, (success, error) => resolve({ success, error }));
       });
       expect(result.success).toBe(false);
+      expect(result.error).toBe('Email, code et nouveau mot de passe requis');
 
       await disconnectClient(client);
     });
@@ -722,9 +769,10 @@ describe('Handlers Coverage', () => {
       await connectClient(client);
 
       const result = await new Promise<{ success: boolean; error?: string }>((resolve) => {
-        client.emit('auth:resetPassword', { code: '999999', newPassword: 'newpass123' }, (success, error) => resolve({ success, error }));
+        client.emit('auth:resetPassword', { email: 'x@y.z', code: '999999', newPassword: 'newpass123' }, (success, error) => resolve({ success, error }));
       });
       expect(result.success).toBe(false);
+      expect(result.error).toBe('Code invalide ou expiré. Vous pouvez demander un nouveau code.');
 
       await disconnectClient(client);
     });
@@ -1462,16 +1510,16 @@ describe('Handlers Coverage', () => {
       await joinRoom(dev, room.id);
 
       // Enregistrer le listener AVANT d'émettre room:leave
-      const closedPromise = new Promise<string>((resolve) => {
-        dev.once('room:closed', (reason) => resolve(reason));
+      const closedPromise = new Promise<RoomClosedPayload>((resolve) => {
+        dev.once('room:closed', (payload) => resolve(payload));
       });
 
       // Attendre un tick pour que le listener soit actif
       await new Promise((r) => setTimeout(r, 50));
       po.emit('room:leave');
 
-      const reason = await closedPromise;
-      expect(reason).toContain('organisateur');
+      const payload = await closedPromise;
+      expect(payload).toEqual({ roomId: room.id, reason: 'po_left' });
 
       await disconnectClient(po);
       await disconnectClient(dev);
@@ -1567,20 +1615,20 @@ describe('Handlers Coverage', () => {
       await connectClient(dev);
       await joinRoom(dev, room.id);
 
-      const closedPromise = new Promise<string>((resolve) => {
-        dev.once('room:closed', (reason) => resolve(reason));
+      const closedPromise = new Promise<RoomClosedPayload>((resolve) => {
+        dev.once('room:closed', (payload) => resolve(payload));
       });
 
       // Déconnexion brutale du PO
       po.disconnect();
 
-      const reason = await Promise.race([
+      const payload = await Promise.race([
         closedPromise,
         new Promise<null>((r) => setTimeout(() => r(null), 35000)),
       ]);
 
-      if (reason) {
-        expect(reason).toContain('organisateur');
+      if (payload) {
+        expect(payload).toEqual({ roomId: room.id, reason: 'po_left' });
       }
 
       await disconnectClient(dev);
@@ -1731,6 +1779,90 @@ describe('Handlers Coverage', () => {
     });
   });
 
+  // ====== ROOM:CREATE — rate limit configurable ======
+
+  describe('room:create — ROOM_CREATE_RATE_LIMIT_PER_MINUTE', () => {
+    afterEach(() => {
+      process.env.ROOM_CREATE_RATE_LIMIT_PER_MINUTE = '1000';
+    });
+
+    it('refuse au-delà de la limite configurée', async () => {
+      process.env.ROOM_CREATE_RATE_LIMIT_PER_MINUTE = '2';
+      const client = createClient();
+      await connectClient(client);
+
+      await createRoom(client);
+      await createRoom(client);
+      const error = await new Promise<string>((resolve) => {
+        client.once('error', resolve);
+        client.emit('room:create', { userName: 'PO' }, () => {});
+      });
+
+      expect(error).toContain('Trop de rooms créées');
+      await disconnectClient(client);
+    });
+
+    it('0 = pas de limite', async () => {
+      process.env.ROOM_CREATE_RATE_LIMIT_PER_MINUTE = '0';
+      const client = createClient();
+      await connectClient(client);
+
+      for (let i = 0; i < 12; i++) {
+        const { room } = await createRoom(client);
+        expect(room.id).toBeDefined();
+      }
+
+      await disconnectClient(client);
+    });
+  });
+
+  // ====== PROTOTYPE POLLUTION (clés fournies par le client) ======
+
+  describe('clés hostiles __proto__ / constructor', () => {
+    it.each(['__proto__', 'constructor'])('room:transferPO vers "%s" échoue sans polluer Object.prototype', async (key) => {
+      const po = createClient();
+      await connectClient(po);
+      const { room, userId: poId } = await createRoom(po);
+
+      const result = await new Promise<{ success: boolean; error?: string }>((resolve) => {
+        po.emit('room:transferPO', { targetUserId: key }, (success, error) => resolve({ success, error }));
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('introuvable');
+      expect(({} as Record<string, unknown>).isPO).toBeUndefined();
+      const check = await new Promise<Room>((resolve) => {
+        const dev = createClient();
+        connectClient(dev).then(() => {
+          dev.emit('room:join', { roomId: room.id, userName: 'Probe' }, (_ok, joined) => {
+            resolve(joined!);
+            disconnectClient(dev);
+          });
+        });
+      });
+      expect(check.poUserId).toBe(poId);
+
+      await disconnectClient(po);
+    });
+
+    it('emoji:send vers "__proto__" est ignoré', async () => {
+      const po = createClient();
+      await connectClient(po);
+      await createRoom(po);
+
+      let received = false;
+      po.on('emoji:received', () => { received = true; });
+      po.emit('emoji:send', { targetUserId: '__proto__', emoji: '🍺' });
+      po.emit('emoji:send', { targetUserId: 'constructor', emoji: '🍺' });
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      expect(received).toBe(false);
+      expect(({} as Record<string, unknown>).isPO).toBeUndefined();
+
+      await disconnectClient(po);
+    });
+  });
+
   // ====== CYCLE DE VOTE COMPLET ======
 
   describe('cycle de vote complet', () => {
@@ -1773,18 +1905,12 @@ describe('Handlers Coverage', () => {
     });
 
     it('vote:start avec item sélectionné → state=voting', async () => {
-      const updated = await new Promise<Room>((resolve) => {
-        po.once('room:updated', resolve);
-        po.emit('vote:start');
-      });
+      const updated = await emitAndWaitRoom(po, () => po.emit('vote:start'), (r) => r.state === 'voting');
       expect(updated.state).toBe('voting');
     });
 
     it('vote:cast avec valeur valide → vote enregistré', async () => {
-      const updated = await new Promise<Room>((resolve) => {
-        dev1.once('room:updated', resolve);
-        dev1.emit('vote:cast', { value: '5' });
-      });
+      const updated = await emitAndWaitRoom(dev1, () => dev1.emit('vote:cast', { value: '5' }), (r) => hasVoteValue(r, itemId, '5'));
       // En état voting, les votes des autres sont masqués pour dev1
       expect(updated.state).toBe('voting');
     });
@@ -1798,10 +1924,7 @@ describe('Handlers Coverage', () => {
     });
 
     it('vote:cast par dev2 avec valeur valide', async () => {
-      const updated = await new Promise<Room>((resolve) => {
-        dev2.once('room:updated', resolve);
-        dev2.emit('vote:cast', { value: '8' });
-      });
+      const updated = await emitAndWaitRoom(dev2, () => dev2.emit('vote:cast', { value: '8' }), (r) => hasVoteValue(r, itemId, '8'));
       expect(updated.state).toBe('voting');
     });
 
@@ -1814,10 +1937,7 @@ describe('Handlers Coverage', () => {
     });
 
     it('vote:reveal par PO → state=revealed, votes visibles', async () => {
-      const updated = await new Promise<Room>((resolve) => {
-        po.once('room:updated', resolve);
-        po.emit('vote:reveal');
-      });
+      const updated = await emitAndWaitRoom(po, () => po.emit('vote:reveal'), (r) => r.state === 'revealed');
       expect(updated.state).toBe('revealed');
       // Après reveal, les votes sont visibles
       const activeItem = updated.items.find(i => i.id === itemId);
@@ -1834,10 +1954,7 @@ describe('Handlers Coverage', () => {
     });
 
     it('vote:reset par PO → state=idle, votes effacés', async () => {
-      const updated = await new Promise<Room>((resolve) => {
-        po.once('room:updated', resolve);
-        po.emit('vote:reset');
-      });
+      const updated = await emitAndWaitRoom(po, () => po.emit('vote:reset'), (r) => r.state === 'idle');
       expect(updated.state).toBe('idle');
     });
 
@@ -1861,24 +1978,16 @@ describe('Handlers Coverage', () => {
 
     it('item:setFinalScore après reveal → score sauvegardé', async () => {
       // Relancer un cycle: start → cast → reveal
-      await new Promise<Room>((resolve) => {
-        po.once('room:updated', resolve);
-        po.emit('vote:start');
-      });
-      await new Promise<Room>((resolve) => {
-        dev1.once('room:updated', resolve);
-        dev1.emit('vote:cast', { value: '5' });
-      });
-      await new Promise<Room>((resolve) => {
-        po.once('room:updated', resolve);
-        po.emit('vote:reveal');
-      });
+      await emitAndWaitRoom(po, () => po.emit('vote:start'), (r) => r.state === 'voting');
+      await emitAndWaitRoom(dev1, () => dev1.emit('vote:cast', { value: '5' }), (r) => hasVoteValue(r, itemId, '5'));
+      await emitAndWaitRoom(po, () => po.emit('vote:reveal'), (r) => r.state === 'revealed');
 
       // Maintenant setFinalScore
-      const updated = await new Promise<Room>((resolve) => {
-        po.once('room:updated', resolve);
-        po.emit('item:setFinalScore', { itemId, score: '5' });
-      });
+      const updated = await emitAndWaitRoom(
+        po,
+        () => po.emit('item:setFinalScore', { itemId, score: '5' }),
+        (r) => r.items.find((i) => i.id === itemId)?.finalScore === '5'
+      );
       const item = updated.items.find(i => i.id === itemId);
       expect(item?.finalScore).toBe('5');
     });
@@ -2182,12 +2291,23 @@ describe('Handlers Coverage', () => {
       expect(typeof result.stats.totalUsers).toBe('number');
     });
 
-    it('admin:getActiveRooms admin → success + tableau', async () => {
-      const result = await new Promise<{ success: boolean; rooms?: any[] }>((resolve) => {
+    it('admin:getActiveRooms admin → success + tableau de résumés avec participants', async () => {
+      // Une room active pour que le tableau contienne au moins un résumé
+      const poClient = createClient();
+      await connectClient(poClient);
+      const { room } = await createRoom(poClient, 'PO résumé');
+
+      const result = await new Promise<{ success: boolean; rooms?: AdminActiveRoomSummary[] }>((resolve) => {
         adminClient.emit('admin:getActiveRooms', (success, rooms) => resolve({ success, rooms }));
       });
       expect(result.success).toBe(true);
       expect(Array.isArray(result.rooms)).toBe(true);
+      const summary = result.rooms!.find((r) => r.id === room.id);
+      expect(summary).toBeDefined();
+      expect(Array.isArray(summary!.participants)).toBe(true);
+      expect(summary!.participants[0]).toMatchObject({ name: 'PO résumé', isPO: true });
+
+      await disconnectClient(poClient);
     });
 
     it('admin:deleteUser (user inexistant) → false', async () => {
@@ -2225,6 +2345,9 @@ describe('Handlers Coverage', () => {
 
   describe('upload d\'images — authentifié', () => {
     let authClient: TypedClientSocket;
+    // Dossiers créés dans public/uploads par ce bloc (supprimés en afterAll : aucun résidu sur disque)
+    let uploadAccountId: string | undefined;
+    let uploadRoomId: string | undefined;
 
     // PNG 1x1 pixel valide en base64
     const validPng = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
@@ -2232,16 +2355,20 @@ describe('Handlers Coverage', () => {
     beforeAll(async () => {
       authClient = createClient();
       await connectClient(authClient);
-      const regResult = await new Promise<{ success: boolean }>((resolve) => {
+      const regResult = await new Promise<{ success: boolean; accountId?: string }>((resolve) => {
         authClient.emit('auth:register', {
           email: `upload-${Date.now()}@example.com`, password: 'password123', name: 'UploadUser', role: 'po',
-        }, (success) => resolve({ success }));
+        }, (success, account) => resolve({ success, accountId: account?.id }));
       });
       expect(regResult.success).toBe(true);
+      uploadAccountId = regResult.accountId;
     });
 
     afterAll(async () => {
       await disconnectClient(authClient);
+      const uploadsRoot = path.resolve(process.cwd(), 'public', 'uploads');
+      if (uploadAccountId) fs.rmSync(path.join(uploadsRoot, 'users', uploadAccountId), { recursive: true, force: true });
+      if (uploadRoomId) fs.rmSync(path.join(uploadsRoot, uploadRoomId), { recursive: true, force: true });
     });
 
     it('auth:uploadDeckImage PNG valide → success + URL', async () => {
@@ -2284,7 +2411,8 @@ describe('Handlers Coverage', () => {
 
     it('deck:uploadImage en room (PO) → success + URL', async () => {
       // Créer une room pour que le PO soit dans la room
-      await createRoom(authClient, 'UploadPO');
+      const created = await createRoom(authClient, 'UploadPO');
+      uploadRoomId = created.room.id;
 
       const result = await new Promise<{ success: boolean; url?: string }>((resolve) => {
         authClient.emit('deck:uploadImage', {

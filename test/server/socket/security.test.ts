@@ -40,6 +40,8 @@ function disconnectClient(client: TypedClientSocket): Promise<void> {
 
 describe('Sécurité — sanitization des entrées', () => {
   beforeAll(async () => {
+    // Plus de 10 créations de room depuis la même IP : on relève le rate limit de room:create
+    process.env.ROOM_CREATE_RATE_LIMIT_PER_MINUTE = '1000';
     httpServer = createServer();
     ioServer = new Server(httpServer, {
       cors: { origin: '*' },
@@ -59,8 +61,8 @@ describe('Sécurité — sanitization des entrées', () => {
 
   // ====== XSS — Échappement HTML ======
 
-  describe('XSS — échappement HTML dans les noms', () => {
-    it('devrait échapper les balises HTML dans le nom lors de room:create', async () => {
+  describe('XSS — conservation brute dans les noms (échappement au rendu React)', () => {
+    it('devrait conserver les balises HTML telles quelles dans le nom lors de room:create', async () => {
       const client = createClient();
       await connectClient(client);
 
@@ -71,15 +73,12 @@ describe('Sécurité — sanitization des entrées', () => {
       });
 
       const userName = result.room.users[result.userId].name;
-      expect(userName).not.toContain('<script>');
-      expect(userName).not.toContain('</script>');
-      expect(userName).toContain('&lt;script&gt;');
-      expect(userName).toContain('&lt;/script&gt;');
+      expect(userName).toBe('<script>alert(1)</script>');
 
       await disconnectClient(client);
     });
 
-    it('devrait échapper les balises HTML dans le nom lors de room:join', async () => {
+    it('devrait conserver les balises HTML telles quelles dans le nom lors de room:join', async () => {
       const poClient = createClient();
       await connectClient(poClient);
 
@@ -101,18 +100,16 @@ describe('Sécurité — sanitization des entrées', () => {
 
       expect(joinResult.success).toBe(true);
       const userName = joinResult.room!.users[joinResult.userId!].name;
-      expect(userName).not.toContain('<img');
-      expect(userName).toContain('&lt;img');
-      // Les guillemets sont échappées, rendant l'attribut onerror inoffensif
-      expect(userName).toContain('&quot;');
+      // Aucun échappement côté serveur : React échappe le texte au rendu
+      expect(userName).toBe('<img onerror="alert(1)" src=x>');
 
       await disconnectClient(poClient);
       await disconnectClient(devClient);
     });
   });
 
-  describe('XSS — échappement HTML dans les items', () => {
-    it('devrait échapper les balises script dans le titre d\'un item', async () => {
+  describe('XSS — conservation brute dans les items (échappement au rendu React)', () => {
+    it('devrait conserver les balises script dans le titre d\'un item', async () => {
       const client = createClient();
       await connectClient(client);
 
@@ -129,15 +126,14 @@ describe('Sécurité — sanitization des entrées', () => {
       });
       const room = await updatePromise;
 
-      expect(room.items[0].title).not.toContain('<script>');
-      expect(room.items[0].title).toContain('&lt;script&gt;');
-      expect(room.items[0].description).not.toContain('<img');
-      expect(room.items[0].description).toContain('&lt;img');
+      expect(room.items[0].title).toContain('<script>');
+      expect(room.items[0].title).toBe('<script>alert("xss")</script>');
+      expect(room.items[0].description).toBe('<img src=x onerror=alert(1)>');
 
       await disconnectClient(client);
     });
 
-    it('devrait échapper les balises HTML dans item:update', async () => {
+    it('devrait conserver les balises HTML telles quelles dans item:update', async () => {
       const client = createClient();
       await connectClient(client);
 
@@ -161,14 +157,13 @@ describe('Sécurité — sanitization des entrées', () => {
         });
       });
 
-      expect(updated.items[0].title).not.toContain('<svg');
-      expect(updated.items[0].title).toContain('&lt;svg');
-      expect(updated.items[0].description).toContain('&#x27;');
+      expect(updated.items[0].title).toBe('"><svg onload=alert(1)>');
+      expect(updated.items[0].description).toBe("' onfocus='alert(1)' autofocus='");
 
       await disconnectClient(client);
     });
 
-    it('devrait échapper le score final dans item:setFinalScore', async () => {
+    it('devrait conserver le score final tel quel dans item:setFinalScore', async () => {
       const client = createClient();
       await connectClient(client);
 
@@ -186,15 +181,14 @@ describe('Sécurité — sanitization des entrées', () => {
         client.emit('item:setFinalScore', { itemId: created.items[0].id, score: '<b>13</b>' });
       });
 
-      expect(updated.items[0].finalScore).not.toContain('<b>');
-      expect(updated.items[0].finalScore).toContain('&lt;b&gt;');
+      expect(updated.items[0].finalScore).toBe('<b>13</b>');
 
       await disconnectClient(client);
     });
   });
 
-  describe('XSS — échappement des 5 caractères HTML dangereux', () => {
-    it('devrait échapper &, <, >, ", \' dans les noms', async () => {
+  describe('XSS — conservation brute des 5 caractères HTML sensibles', () => {
+    it('devrait conserver &, <, >, ", \' tels quels dans les noms', async () => {
       const client = createClient();
       await connectClient(client);
 
@@ -205,13 +199,7 @@ describe('Sécurité — sanitization des entrées', () => {
       });
 
       const name = result.room.users[result.userId].name;
-      expect(name).toContain('&amp;');
-      expect(name).toContain('&lt;');
-      expect(name).toContain('&gt;');
-      expect(name).toContain('&quot;');
-      expect(name).toContain('&#x27;');
-      expect(name).not.toContain('A&B');
-      expect(name).not.toContain('<C>');
+      expect(name).toBe('A&B<C>D"E\'F');
 
       await disconnectClient(client);
     });
@@ -424,16 +412,17 @@ describe('Sécurité — sanitization des entrées', () => {
       const client = createClient();
       await connectClient(client);
 
-      await new Promise<void>((resolve) => {
-        client.emit('room:create', { userName: 'DeckLocalPO' }, () => resolve());
+      const roomId = await new Promise<string>((resolve) => {
+        client.emit('room:create', { userName: 'DeckLocalPO' }, (room) => resolve(room.id));
       });
 
+      // Les URLs d'uploads doivent appartenir au dossier de la room (ou être des images statiques)
       const validDeck: DeckConfig = {
         cards: [
-          { value: '1', label: '1', frontImageUrl: '/uploads/users/abc/card.png' },
+          { value: '1', label: '1', frontImageUrl: `/uploads/${roomId}/card.png` },
           { value: '2', label: '2', frontImageUrl: '/images/cartes/heart.png' },
         ],
-        backImageUrl: '/uploads/users/abc/back.png',
+        backImageUrl: `/uploads/${roomId}/back.png`,
       };
 
       const updatePromise = new Promise<Room>((resolve) => {
@@ -467,10 +456,8 @@ describe('Sécurité — sanitization des entrées', () => {
       client.emit('deck:update', { deck: xssDeck });
       const room = await updatePromise;
 
-      expect(room.deck.cards[0].value).not.toContain('<script>');
-      expect(room.deck.cards[0].value).toContain('&lt;script&gt;');
-      expect(room.deck.cards[0].label).not.toContain('<b>');
-      expect(room.deck.cards[0].label).toContain('&lt;b&gt;');
+      expect(room.deck.cards[0].value).toBe('<script>');
+      expect(room.deck.cards[0].label).toBe('<b>Bold</b>');
       expect(room.deck.cards[1].label).toBe('Normal');
 
       await disconnectClient(client);
@@ -712,8 +699,8 @@ describe('Sécurité — sanitization des entrées', () => {
 
   // ====== Payloads combinés XSS ======
 
-  describe('payloads XSS avancés', () => {
-    it('devrait neutraliser une injection SVG', async () => {
+  describe('payloads XSS avancés (conservation brute, échappement au rendu React)', () => {
+    it('devrait conserver une injection SVG telle quelle', async () => {
       const client = createClient();
       await connectClient(client);
 
@@ -729,14 +716,13 @@ describe('Sécurité — sanitization des entrées', () => {
         });
       });
 
-      expect(room.items[0].title).not.toContain('<svg');
-      expect(room.items[0].title).toContain('&lt;svg');
-      expect(room.items[0].description).not.toContain('<img');
+      expect(room.items[0].title).toBe('<svg/onload=alert(1)>');
+      expect(room.items[0].description).toContain('<img onerror=alert(1) src=1>');
 
       await disconnectClient(client);
     });
 
-    it('devrait neutraliser une injection event handler', async () => {
+    it('devrait conserver une injection event handler telle quelle', async () => {
       const client = createClient();
       await connectClient(client);
 
@@ -749,13 +735,12 @@ describe('Sécurité — sanitization des entrées', () => {
       });
 
       const name = result.room.users[result.userId].name;
-      expect(name).not.toContain('"');
-      expect(name).toContain('&quot;');
+      expect(name).toBe('x" onclick="alert(1)');
 
       await disconnectClient(client);
     });
 
-    it('devrait neutraliser une injection via balise iframe', async () => {
+    it('devrait conserver une injection via balise iframe telle quelle', async () => {
       const client = createClient();
       await connectClient(client);
 
@@ -771,10 +756,8 @@ describe('Sécurité — sanitization des entrées', () => {
         });
       });
 
-      expect(room.items[0].title).not.toContain('<iframe');
-      expect(room.items[0].title).toContain('&lt;iframe');
-      expect(room.items[0].description).not.toContain('<object');
-      expect(room.items[0].description).toContain('&lt;object');
+      expect(room.items[0].title).toBe('<iframe src="javascript:alert(1)">');
+      expect(room.items[0].description).toBe('<object data="javascript:alert(1)">');
 
       await disconnectClient(client);
     });

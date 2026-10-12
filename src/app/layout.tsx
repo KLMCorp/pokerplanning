@@ -1,7 +1,9 @@
 import type { Metadata } from 'next';
 import { Inter } from 'next/font/google';
 import './globals.css';
+import { connection } from 'next/server';
 import ClientProviders from '@/components/ClientProviders';
+import { getServerRuntimeConfig } from '@/lib/serverRuntimeConfig';
 
 const inter = Inter({ subsets: ['latin'] });
 
@@ -10,20 +12,32 @@ export const metadata: Metadata = {
   description: 'Application de Planning Poker en ligne pour estimer vos items en équipe',
 };
 
-export default function RootLayout({
+// Exécuté avant le premier rendu : reproduit la logique initiale de ThemeContext
+// (localStorage, sinon préférence de l'OS) pour éviter un flash clair avant l'hydratation.
+const THEME_INIT_SCRIPT = `try{var t=localStorage.getItem('pokerPlanning_theme');if(t?t==='dark':window.matchMedia('(prefers-color-scheme: dark)').matches){document.documentElement.classList.add('dark')}}catch(e){}`;
+
+export default async function RootLayout({
   children,
 }: {
   children: React.ReactNode;
 }) {
+  // Rendu à chaque requête (toutes les pages deviennent dynamiques) : SOCKET_URL et ALLOW_UPLOADS
+  // sont lues au lancement du container, pas figées par `next build`.
+  await connection();
+  const runtimeConfig = getServerRuntimeConfig();
+
   return (
-    <html lang="fr">
+    <html lang="fr" suppressHydrationWarning>
+      <head>
+        <script dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }} />
+      </head>
       <body className={`${inter.className} antialiased`}>
-        <ClientProviders>
+        <ClientProviders runtimeConfig={runtimeConfig}>
           {children}
           <footer className="w-full py-3 text-center text-xs text-gray-400 dark:text-gray-600">
             <div className="inline-flex items-center gap-3">
               <a
-                href="https://github.com/KLMCorp"
+                href="https://github.com/KLMCorp/pokerplanning"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="inline-flex items-center gap-1.5 hover:text-gray-600 dark:hover:text-gray-400 transition-colors"

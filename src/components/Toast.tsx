@@ -9,7 +9,7 @@ interface ToastMessage {
 }
 
 interface ToastContextType {
-  showToast: (text: string, type?: 'success' | 'error') => void;
+  showToast: (text: string, type?: 'success' | 'error', durationMs?: number) => void;
 }
 
 const ToastContext = createContext<ToastContextType | null>(null);
@@ -26,12 +26,12 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
   const nextId = useRef(0);
 
-  const showToast = useCallback((text: string, type: 'success' | 'error' = 'success') => {
+  const showToast = useCallback((text: string, type: 'success' | 'error' = 'success', durationMs: number = 3000) => {
     const id = nextId.current++;
     setToasts(prev => [...prev, { id, text, type }]);
     setTimeout(() => {
       setToasts(prev => prev.filter(t => t.id !== id));
-    }, 3000);
+    }, durationMs);
   }, []);
 
   return (

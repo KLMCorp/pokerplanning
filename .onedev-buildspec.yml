@@ -1,0 +1,185 @@
+version: 34
+
+jobs:
+# =============================================================================
+# Build — déclenché sur push vers main
+# =============================================================================
+# Format : `commands` est une chaîne (`|`) ; une liste YAML rend le fichier
+# illisible par le serveur (aucun job ne se déclenche).
+# `set -e` obligatoire : le script est exécuté par `sh` sans option.
+# Ne jamais ajouter de `jobExecutor` : un nom inexistant invalide tout le fichier.
+- name: Build
+  steps:
+  - !CheckoutStep
+    name: Checkout
+    cloneCredential: !DefaultCredential {}
+    withLfs: false
+    withSubmodules: false
+    condition: ALL_PREVIOUS_STEPS_WERE_SUCCESSFUL
+  - !CommandStep
+    name: Install dependencies
+    runInContainer: true
+    image: node:24-alpine
+    interpreter: !DefaultInterpreter
+      commands: |
+        set -e
+        apk add --no-cache python3 make g++
+        npm ci
+        npx tsc -v | grep -q "Version 7"
+    useTTY: false
+    condition: ALL_PREVIOUS_STEPS_WERE_SUCCESSFUL
+  - !CommandStep
+    name: Build
+    runInContainer: true
+    image: node:24-alpine
+    interpreter: !DefaultInterpreter
+      commands: |
+        set -e
+        npm run build
+    useTTY: false
+    condition: ALL_PREVIOUS_STEPS_WERE_SUCCESSFUL
+  triggers:
+  - !BranchUpdateTrigger
+    branches: main
+  retryCondition: never
+  maxRetries: 0
+  retryDelay: 30
+  timeout: 3600
+
+# =============================================================================
+# CI — déclenché sur Pull Request vers main (feature/*, tech/*, etc.)
+# =============================================================================
+- name: CI
+  steps:
+  - !CheckoutStep
+    name: Checkout
+    cloneCredential: !DefaultCredential {}
+    withLfs: false
+    withSubmodules: false
+    condition: ALL_PREVIOUS_STEPS_WERE_SUCCESSFUL
+  - !CommandStep
+    name: Install dependencies
+    runInContainer: true
+    image: node:24-alpine
+    interpreter: !DefaultInterpreter
+      commands: |
+        set -e
+        apk add --no-cache python3 make g++
+        npm ci
+        npx tsc -v | grep -q "Version 7"
+    useTTY: false
+    condition: ALL_PREVIOUS_STEPS_WERE_SUCCESSFUL
+  - !CommandStep
+    name: Lint
+    runInContainer: true
+    image: node:24-alpine
+    interpreter: !DefaultInterpreter
+      commands: |
+        set -e
+        npm run lint
+    useTTY: false
+    condition: ALL_PREVIOUS_STEPS_WERE_SUCCESSFUL
+  - !CommandStep
+    name: Type check
+    runInContainer: true
+    image: node:24-alpine
+    interpreter: !DefaultInterpreter
+      commands: |
+        set -e
+        npm run typecheck
+    useTTY: false
+    condition: ALL_PREVIOUS_STEPS_WERE_SUCCESSFUL
+  - !CommandStep
+    name: Tests
+    runInContainer: true
+    image: node:24-alpine
+    interpreter: !DefaultInterpreter
+      commands: |
+        set -e
+        npm run test:run
+    useTTY: false
+    condition: ALL_PREVIOUS_STEPS_WERE_SUCCESSFUL
+  - !CommandStep
+    name: Build
+    runInContainer: true
+    image: node:24-alpine
+    interpreter: !DefaultInterpreter
+      commands: |
+        set -e
+        npm run build
+    useTTY: false
+    condition: ALL_PREVIOUS_STEPS_WERE_SUCCESSFUL
+  triggers:
+  - !PullRequestUpdateTrigger
+    branches: main
+  retryCondition: never
+  maxRetries: 0
+  retryDelay: 30
+  timeout: 3600
+
+# =============================================================================
+# Release — déclenché par la création d'un tag vX.Y.Z sur un commit de main
+# =============================================================================
+# Lint, typecheck, tests, puis build multi-arch (linux/amd64 + linux/arm64) et push
+# sur Docker Hub : klmcorp/pokerplanning:<tag> et :latest.
+# Les pré-versions (vX.Y.Z-rc1, contenant « - ») sont exclues : elles écraseraient :latest.
+# Prérequis (Administration > Job Executors), une fois. Sans exécuteur configuré, aucun job
+# (CI, Build, Release) ne tourne : créer d'abord un exécuteur Server Docker général pour
+# Build/CI, puis l'exécuteur dédié ci-dessous.
+#   - exécuteur DÉDIÉ Server Docker ou Remote Docker (pas Kubernetes), placé en tête de
+#     liste, « Applicable Jobs » restreint au projet PlanningPoker et au job Release ;
+#   - sur cet exécuteur seulement : Registry Logins = URL vide (Docker Hub), compte autorisé
+#     sur klmcorp, access token Docker Hub Read & Write (impossible à référencer ici en v34) ;
+#   - builder buildx de l'exécuteur en driver docker-container (champ Docker Builder) ;
+#   - hôte Docker : plugin buildx + émulation (docker run --privileged --rm tonistiigi/binfmt --install all).
+- name: Release
+  steps:
+  - !CheckoutStep
+    name: Checkout
+    cloneCredential: !DefaultCredential {}
+    withLfs: false
+    withSubmodules: false
+    condition: ALL_PREVIOUS_STEPS_WERE_SUCCESSFUL
+  - !CommandStep
+    name: Install dependencies
+    runInContainer: true
+    image: node:24-alpine
+    interpreter: !DefaultInterpreter
+      commands: |
+        set -e
+        apk add --no-cache python3 make g++
+        npm ci
+        npx tsc -v | grep -q "Version 7"
+    useTTY: false
+    condition: ALL_PREVIOUS_STEPS_WERE_SUCCESSFUL
+  - !CommandStep
+    name: Lint, type check and tests
+    runInContainer: true
+    image: node:24-alpine
+    interpreter: !DefaultInterpreter
+      commands: |
+        set -e
+        case "@tag@" in
+          *-*) echo "Tag de pré-version @tag@ : pas de publication (latest serait écrasé)"; exit 1;;
+        esac
+        npm run lint
+        npm run typecheck
+        npm run test:run
+    useTTY: false
+    condition: ALL_PREVIOUS_STEPS_WERE_SUCCESSFUL
+  - !BuildImageStep
+    name: Build and push image
+    dockerfile: Dockerfile.local
+    output: !RegistryOutput
+      tags: klmcorp/pokerplanning:@tag@ klmcorp/pokerplanning:latest
+    platforms: linux/amd64,linux/arm64
+    moreOptions: '--build-arg APP_VERSION=@tag@'
+    condition: ALL_PREVIOUS_STEPS_WERE_SUCCESSFUL
+  triggers:
+  - !TagCreateTrigger
+    tags: v*.*.* -v*-*
+    branches: main
+  retryCondition: never
+  maxRetries: 0
+  retryDelay: 30
+  timeout: 10800

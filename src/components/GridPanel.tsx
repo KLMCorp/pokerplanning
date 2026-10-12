@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useCallback, useState } from 'react';
+import { isPanelDrag } from '@/lib/panelDrag';
 
 export type DropZone = 'top' | 'left' | 'right';
 
@@ -46,6 +47,7 @@ export default React.memo(function GridPanel({
   }, [canDropBeside]);
 
   const handleDragOver = useCallback((e: React.DragEvent<HTMLDivElement>) => {
+    if (!isPanelDrag(e.dataTransfer.types)) return;
     e.preventDefault();
     e.stopPropagation();
     e.dataTransfer.dropEffect = 'move';
@@ -53,6 +55,7 @@ export default React.memo(function GridPanel({
   }, [getDropZone]);
 
   const handleDrop = useCallback((e: React.DragEvent<HTMLDivElement>) => {
+    if (!isPanelDrag(e.dataTransfer.types)) return;
     e.preventDefault();
     e.stopPropagation();
     const zone = getDropZone(e);
@@ -61,6 +64,7 @@ export default React.memo(function GridPanel({
   }, [getDropZone, onDropZone]);
 
   const handleDragLeave = useCallback((e: React.DragEvent<HTMLDivElement>) => {
+    if (!isPanelDrag(e.dataTransfer.types)) return;
     if (!e.currentTarget.contains(e.relatedTarget as Node)) {
       setActiveZone(null);
     }

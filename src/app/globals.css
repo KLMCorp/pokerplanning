@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
 
 .text-median-green {
   color: #0cab56;
@@ -48,6 +49,7 @@
 @source "../components/**/*.{js,ts,jsx,tsx}";
 @source "../app/**/*.{js,ts,jsx,tsx}";
 @source "../pages/**/*.{js,ts,jsx,tsx}";
+@source "../lib/**/*.{js,ts}";
 
 /* ========================================
    THEME VARIABLES
@@ -442,67 +444,6 @@ body {
   border-color: var(--poker-gold);
   outline: none;
   box-shadow: 0 0 0 2px rgba(212, 175, 55, 0.2);
-}
-
-/* ========================================
-   PANEL STYLES (for light/dark mode)
-   ======================================== */
-
-/* Force correct background colors for panels in light mode */
-/* These override any issues with Tailwind v4 class generation */
-
-/* Light mode backgrounds */
-:root:not(.dark) .bg-white\/80,
-:root:not(.dark) [class*="bg-white/80"] {
-  background-color: rgba(255, 255, 255, 0.8) !important;
-}
-
-:root:not(.dark) .bg-white,
-:root:not(.dark) [class*="bg-white "] {
-  background-color: rgb(255, 255, 255) !important;
-}
-
-:root:not(.dark) .bg-gray-50 {
-  background-color: rgb(249, 250, 251) !important;
-}
-
-:root:not(.dark) .bg-gray-100 {
-  background-color: rgb(243, 244, 246) !important;
-}
-
-/* Dark mode backgrounds */
-.dark .bg-gray-800\/80,
-.dark [class*="dark:bg-gray-800/80"] {
-  background-color: rgba(31, 41, 55, 0.8) !important;
-}
-
-.dark .bg-gray-800 {
-  background-color: rgb(31, 41, 55) !important;
-}
-
-.dark .bg-gray-700 {
-  background-color: rgb(55, 65, 81) !important;
-}
-
-.dark .bg-gray-700\/50 {
-  background-color: rgba(55, 65, 81, 0.5) !important;
-}
-
-/* Text colors */
-:root:not(.dark) .text-gray-900 {
-  color: rgb(17, 24, 39) !important;
-}
-
-:root:not(.dark) .text-gray-700 {
-  color: rgb(55, 65, 81) !important;
-}
-
-.dark .text-white {
-  color: rgb(255, 255, 255) !important;
-}
-
-.dark .text-gray-300 {
-  color: rgb(209, 213, 219) !important;
 }
 
 /* ========================================

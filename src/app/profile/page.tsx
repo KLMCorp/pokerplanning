@@ -6,8 +6,9 @@
 
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { useTranslations } from 'next-intl';
+import { useTranslations, useFormatter } from 'next-intl';
 import { useAuth } from '@/contexts/AuthContext';
+import { useConfirm } from '@/components/ConfirmDialog';
 import { RoomHistory } from '@/types';
 import ThemeToggle from '@/components/ThemeToggle';
 import LanguageToggle from '@/components/LanguageToggle';
@@ -16,7 +17,9 @@ export default function ProfilePage() {
   const router = useRouter();
   const t = useTranslations('profile');
   const tCommon = useTranslations('common');
-  const { account, isAuthenticated, isLoading, roomHistory, refreshHistory, deleteRoomHistory, logout } = useAuth();
+  const format = useFormatter();
+  const { confirm } = useConfirm();
+  const { account, isAuthenticated, isServerConnected, isLoading, roomHistory, refreshHistory, deleteRoomHistory, logout } = useAuth();
   const [expandedRoom, setExpandedRoom] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -30,10 +33,11 @@ export default function ProfilePage() {
 
   // Rafraîchir l'historique au montage
   useEffect(() => {
-    if (isAuthenticated) {
+    // Attendre l'association serveur du socket au compte (auth:reconnect)
+    if (isAuthenticated && isServerConnected) {
       refreshHistory();
     }
-  }, [isAuthenticated, refreshHistory]);
+  }, [isAuthenticated, isServerConnected, refreshHistory]);
 
   if (isLoading) {
     return (
@@ -48,7 +52,7 @@ export default function ProfilePage() {
   }
 
   const handleDelete = async (historyId: string) => {
-    if (!confirm(t('confirmDeleteRoom'))) return;
+    if (!(await confirm({ message: t('confirmDeleteRoom') }))) return;
     setDeletingId(historyId);
     await deleteRoomHistory(historyId);
     setDeletingId(null);
@@ -77,7 +81,7 @@ export default function ProfilePage() {
 
   const handleBulkDelete = async () => {
     if (selectedIds.size === 0) return;
-    if (!confirm(t('confirmDeleteRooms', { count: selectedIds.size }))) return;
+    if (!(await confirm({ message: t('confirmDeleteRooms', { count: selectedIds.size }) }))) return;
 
     setIsDeleting(true);
     const idsToDelete = Array.from(selectedIds);
@@ -91,7 +95,7 @@ export default function ProfilePage() {
   };
 
   const formatDate = (timestamp: number) => {
-    return new Date(timestamp).toLocaleDateString('fr-FR', {
+    return format.dateTime(new Date(timestamp), {
       day: '2-digit',
       month: '2-digit',
       year: 'numeric',
@@ -164,7 +168,7 @@ export default function ProfilePage() {
               {account.avatarUrl ? (
                 <img
                   src={account.avatarUrl}
-                  alt="Avatar"
+                  alt={tCommon('avatar')}
                   className="w-full h-full object-cover"
                 />
               ) : (
@@ -359,9 +363,9 @@ export default function ProfilePage() {
                                   {item.description || ' '}
                                 </div>
                                 <div className={`flex flex-wrap gap-2 mt-2 ${Object.keys(item.votes).length > 0 ? 'block' : 'hidden'}`}>
-                                  {Object.entries(item.votes).map(([oderId, vote]) => (
+                                  {Object.entries(item.votes).map(([voterId, vote]) => (
                                     <span
-                                      key={oderId}
+                                      key={voterId}
                                       className="text-xs bg-gray-100 dark:bg-gray-700 px-2 py-1 rounded text-gray-600 dark:text-gray-300"
                                     >
                                       {vote.voterName}: {vote.value}

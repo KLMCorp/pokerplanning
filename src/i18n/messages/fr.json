@@ -32,7 +32,11 @@
     "minutesAgo": "il y a {minutes} min",
     "hoursAgo": "il y a {hours}h",
     "daysAgo": "il y a {days}j",
-    "organizer": "Organisateur"
+    "organizer": "Organisateur",
+    "notConnected": "Non connecté au serveur",
+    "roomJoinError": "Erreur lors de la connexion à la room",
+    "sessionExpiredRelogin": "Votre session a expiré. Veuillez vous reconnecter.",
+    "avatar": "Avatar"
   },
   "home": {
     "title": "Planning Poker",
@@ -74,6 +78,8 @@
     "connectionError": "Erreur de connexion",
     "roomLabel": "Room:",
     "roomClosedByPO": "L'organisateur a quitté la room. La session est terminée.",
+    "roomClosedExpired": "La room a expiré et a été fermée.",
+    "roomClosedGeneric": "La room a été fermée.",
     "resetLayout": "Réinitialiser le layout",
     "panelTable": "Table",
     "panelCards": "Cartes",
@@ -83,7 +89,9 @@
     "panelUsers": "Participants",
     "timeRemaining": "Temps restant avant expiration de la room",
     "promoteOrganizer": "Nommer organisateur",
-    "promoteOrganizerConfirm": "Nommer {name} organisateur ?"
+    "promoteOrganizerConfirm": "Nommer {name} organisateur ?",
+    "finalScore": "Score: {score}",
+    "votesProgress": "{voted} / {total} votes"
   },
   "auth": {
     "login": "Connexion",
@@ -171,7 +179,8 @@
     "playAgain": "Rejouer",
     "nextItem": "Item suivant",
     "settings": "Paramètres",
-    "allowEmojis": "Autoriser les emojis"
+    "allowEmojis": "Autoriser les emojis",
+    "customizeCards": "Personnaliser les cartes"
   },
   "cardPicker": {
     "chooseCard": "Choisissez votre carte",
@@ -204,7 +213,8 @@
     "csvScore": "Score",
     "csvTotal": "Total",
     "csvItems": "items",
-    "csvPoints": "points"
+    "csvPoints": "points",
+    "clipboardTotal": "Total: {points} points ({count} items)"
   },
   "backlog": {
     "title": "Mon Backlog",
@@ -289,7 +299,11 @@
     "roomTtlLabel": "Durée de vie",
     "roomTtlMax": "Max: {hours}h",
     "roomTtlCurrent": "Actuel",
-    "roomTtlNote": "Cette configuration s'applique aux nouvelles rooms que vous créez. Les rooms existantes ne sont pas affectées."
+    "roomTtlNote": "Cette configuration s'applique aux nouvelles rooms que vous créez. Les rooms existantes ne sont pas affectées.",
+    "upload": "Importer",
+    "minutesShort": "{minutes} min",
+    "hoursShort": "{hours}h",
+    "hoursMinutesShort": "{hours}h {minutes}min"
   },
   "profile": {
     "roomHistory": "Historique des rooms",
@@ -417,6 +431,47 @@
     "expired": "Expirée",
     "stateVoting": "Vote en cours",
     "stateRevealed": "Votes révélés",
-    "stateIdle": "En attente"
+    "stateIdle": "En attente",
+    "durationHoursMinutes": "{hours}h {minutes}min",
+    "durationMinutes": "{minutes}min"
+  },
+  "card": {
+    "backAlt": "Dos de carte"
+  },
+  "emojiPicker": {
+    "sendTo": "Envoyer à <highlight>{name}</highlight>"
+  },
+  "deckSettings": {
+    "title": "Cartes de la room",
+    "cardBack": "Dos des cartes (commun à tous)",
+    "cardFront": "Recto des cartes",
+    "noImage": "Aucune image",
+    "changeImage": "Changer l'image",
+    "upload": "Importer",
+    "uploading": "Envoi...",
+    "remove": "Retirer",
+    "instructions": "Instructions",
+    "acceptedFormats": "Formats acceptés: PNG, JPG, WEBP",
+    "maxSize": "Taille maximum: 2 Mo par image",
+    "sharedWithAll": "Les images sont visibles par tous les participants de cette room",
+    "backOverridesUsers": "Si un dos est défini ici, il remplace le dos personnel de chaque participant.",
+    "unsupportedFormat": "Format non supporté. Utilisez PNG, JPG ou WEBP.",
+    "imageTooLarge": "L'image ne doit pas dépasser 2 Mo.",
+    "uploadError": "Erreur lors de l'envoi de l'image",
+    "backAlt": "Dos de carte"
+  },
+  "cardDescriptions": {
+    "v0": "Même pas un effort",
+    "v1": "Un café et c'est réglé",
+    "v2": "Une mini-quête annexe",
+    "v3": "Pas bien méchant",
+    "v5": "Ça commence à se voir",
+    "v8": "Une petite épopée",
+    "v13": "Ça pique un peu",
+    "v20": "Gros morceau à avaler",
+    "v40": "Un gros projet dans le projet",
+    "v100": "Force et honneur",
+    "unknown": "Je ne sais pas",
+    "coffee": "Besoin d'une pause"
   }
 }

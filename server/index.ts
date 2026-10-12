@@ -16,8 +16,10 @@ import compression from 'compression';
 import rateLimit from 'express-rate-limit';
 import path from 'path';
 import { setupSocketHandlers } from './socket/handlers';
+import { getHandshakeIp, getTrustedHops } from './utils/clientIp';
+import { getEnvInt } from './utils/env';
 import { stopCleanupInterval as stopRoomCleanup } from './store/roomStore';
-import { stopCleanupInterval as stopSessionCleanup } from './store/userStore';
+import { stopCleanupInterval as stopSessionCleanup, closeAllActiveRoomHistories } from './store/userStore';
 import { ClientToServerEvents, ServerToClientEvents } from '../src/types';
 
 const PORT = process.env.PORT || 3001;
@@ -32,6 +34,9 @@ console.log('CORS origins configured:', corsOrigins);
 
 // Création de l'application Express
 const app = express();
+
+// Nombre de proxys de confiance (TRUST_PROXY), identique à celui utilisé pour Socket.IO
+app.set('trust proxy', getTrustedHops() > 0 ? getTrustedHops() : false);
 
 // Middlewares de sécurité
 app.use(helmet({
@@ -64,10 +69,12 @@ app.use(cors({
 // Rate limiting global
 const globalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 300, // 300 requêtes par fenêtre (santé + uploads statiques)
+  max: 300, // 300 requêtes par fenêtre (santé ; /uploads/ exclu, voir skip)
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Trop de requêtes, veuillez réessayer plus tard' },
+  // Les images /uploads/ arrivent via le rewrite Next (toutes depuis 127.0.0.1) : la limite deviendrait globale
+  skip: (req) => req.path.startsWith('/uploads/'),
 });
 app.use(globalLimiter);
 
@@ -108,7 +115,7 @@ app.get('/health', (req, res) => {
 const httpServer = createServer(app);
 
 // Limite de connexions WebSocket par IP
-const MAX_WS_CONNECTIONS_PER_IP = parseInt(process.env.MAX_WS_CONNECTIONS_PER_IP || '20', 10);
+// Limite lue paresseusement (getEnvInt) à chaque connexion ; 0 = illimité
 const wsConnectionsByIp = new Map<string, number>();
 
 // Configuration Socket.IO
@@ -124,17 +131,10 @@ const io = new Server<ClientToServerEvents, ServerToClientEvents>(httpServer, {
 
 // Middleware de limite de connexions par IP
 io.use((socket, next) => {
-  let ip: string;
-  if (process.env.TRUST_PROXY === 'true') {
-    const forwarded = socket.handshake.headers['x-forwarded-for'];
-    ip = forwarded
-      ? (Array.isArray(forwarded) ? forwarded[0] : forwarded.split(',')[0].trim())
-      : socket.handshake.address;
-  } else {
-    ip = socket.handshake.address;
-  }
+  const ip = getHandshakeIp(socket.handshake);
   const current = wsConnectionsByIp.get(ip) || 0;
-  if (current >= MAX_WS_CONNECTIONS_PER_IP) {
+  const maxPerIp = getEnvInt('MAX_WS_CONNECTIONS_PER_IP', 20);
+  if (maxPerIp > 0 && current >= maxPerIp) {
     return next(new Error('Trop de connexions depuis cette adresse'));
   }
   wsConnectionsByIp.set(ip, current + 1);
@@ -153,6 +153,12 @@ io.use((socket, next) => {
 setupSocketHandlers(io);
 
 // Démarrage du serveur
+// Les rooms sont en mémoire : au démarrage, plus aucune room n'est active, on clôt les historiques orphelins
+const closedHistories = closeAllActiveRoomHistories();
+if (closedHistories > 0) {
+  console.log(`[Startup] ${closedHistories} room histories marked inactive (rooms lost on restart)`);
+}
+
 httpServer.listen(Number(PORT), '0.0.0.0', () => {
   const adminEmail = process.env.ADMIN_EMAIL;
   console.log(`
@@ -197,6 +203,9 @@ process.on('unhandledRejection', (reason, promise) => {
   console.error('Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
+// Fail-fast volontaire : après une exception non interceptée l'état peut être corrompu,
+// Docker redémarre le conteneur. Les handlers Socket.IO sont protégés par createSafeOn
+// (try/catch synchrone et asynchrone) : un payload client hors contrat n'arrive donc jamais ici.
 process.on('uncaughtException', (error) => {
   console.error('Uncaught Exception:', error);
   gracefulShutdown();

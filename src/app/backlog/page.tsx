@@ -6,7 +6,7 @@
 
 import { useEffect, useState, useRef, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
-import { useTranslations } from 'next-intl';
+import { useTranslations, useFormatter } from 'next-intl';
 import { useAuth } from '@/contexts/AuthContext';
 import { useSocket } from '@/contexts/SocketContext';
 import { useConfirm } from '@/components/ConfirmDialog';
@@ -19,7 +19,8 @@ export default function BacklogPage() {
   const router = useRouter();
   const t = useTranslations('backlog');
   const tCommon = useTranslations('common');
-  const { account, isAuthenticated, isLoading: authLoading, logout } = useAuth();
+  const format = useFormatter();
+  const { account, isAuthenticated, isServerConnected, isLoading: authLoading, logout } = useAuth();
   const { getBacklogItems, createBacklogItem, updateBacklogItem, deleteBacklogItem, reorderBacklogItem } = useSocket();
   const { confirm } = useConfirm();
 
@@ -49,10 +50,11 @@ export default function BacklogPage() {
   }, [getBacklogItems]);
 
   useEffect(() => {
-    if (isAuthenticated) {
+    // Attendre l'association serveur du socket au compte (auth:reconnect), sinon la liste revient vide
+    if (isAuthenticated && isServerConnected) {
       loadItems();
     }
-  }, [isAuthenticated, loadItems]);
+  }, [isAuthenticated, isServerConnected, loadItems]);
 
   // Drag and drop handlers — doivent être avant les early returns
   const handleDragStart = useCallback((e: React.DragEvent, itemId: string) => {
@@ -263,7 +265,7 @@ export default function BacklogPage() {
   };
 
   const formatDate = (timestamp: number) => {
-    return new Date(timestamp).toLocaleDateString('fr-FR', {
+    return format.dateTime(new Date(timestamp), {
       day: '2-digit',
       month: '2-digit',
       year: 'numeric',
@@ -570,7 +572,7 @@ export default function BacklogPage() {
                           {item.title}
                         </h3>
                         <span className="px-2 py-0.5 bg-green-100 dark:bg-green-900/50 text-green-700 dark:text-green-400 text-xs rounded-full font-medium">
-                          {item.estimatedPoints} pts
+                          {item.estimatedPoints} {tCommon('points')}
                         </span>
                       </div>
                       {item.description && (

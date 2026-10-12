@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { createHash } from 'crypto';
+import bcrypt from 'bcrypt';
 
 // Mock modules avant tout import
 vi.mock('better-sqlite3', () => {
@@ -33,10 +35,6 @@ vi.mock('fs', () => ({
   mkdirSync: vi.fn(),
 }));
 
-vi.mock('uuid', () => ({
-  v4: vi.fn(() => 'test-uuid-123'),
-}));
-
 // Import après les mocks - accéder au mock via le module
 import Database from 'better-sqlite3';
 
@@ -49,6 +47,10 @@ const MockDb = Database as unknown as {
 
 // Import du module à tester
 import * as userStore from '../../../server/store/userStore';
+
+// Hash attendu pour un code de reset : sha256(`${userId}:${code}`)
+const resetHash = (userId: string, code: string): string =>
+  createHash('sha256').update(`${userId}:${code}`).digest('hex');
 
 describe('userStore', () => {
   beforeEach(() => {
@@ -85,6 +87,22 @@ describe('userStore', () => {
 
       expect(result.success).toBe(false);
       expect(result.error).toBe('Email invalide');
+    });
+
+    it('devrait rejeter rapidement un email géant conçu pour le backtracking (ReDoS)', async () => {
+      const start = Date.now();
+      const result = await userStore.register('a@' + '.'.repeat(200_000) + '@', 'password123', 'Test User', 'dev');
+
+      expect(result.success).toBe(false);
+      expect(result.error).toBe('Email invalide');
+      expect(Date.now() - start).toBeLessThan(1000);
+    });
+
+    it('isValidEmail : longueur max et motifs pathologiques', () => {
+      expect(userStore.isValidEmail('user@mail.example.com')).toBe(true);
+      expect(userStore.isValidEmail('a@b')).toBe(false);
+      expect(userStore.isValidEmail('a@b..c')).toBe(false);
+      expect(userStore.isValidEmail('a'.repeat(250) + '@b.co')).toBe(false);
     });
 
     it('devrait échouer avec un mot de passe trop court', async () => {
@@ -603,91 +621,226 @@ describe('userStore', () => {
 
         expect(token).toMatch(/^\d{6}$/);
       });
+
+      it('devrait stocker le hash sha256(userId:code) et non le code en clair', () => {
+        const code = userStore.createPasswordResetToken('user-123');
+
+        const insertCall = MockDb.mockRun.mock.calls.find((call) => call.length === 3);
+        expect(insertCall).toBeDefined();
+        expect(insertCall![0]).toMatch(/^[0-9a-f]{64}$/);
+        expect(insertCall![0]).toBe(resetHash('user-123', code));
+        expect(insertCall![0]).not.toBe(code);
+      });
     });
 
     describe('validateResetToken', () => {
-      it('devrait valider un token valide', () => {
-        MockDb.mockGet.mockReturnValueOnce({
-          user_id: 'user-123',
-          expires_at: Date.now() + 3600000,
-          used: 0,
-        });
+      const userRow = { id: 'user-123', name: 'U' };
+      const tokenRow = (over: Record<string, unknown> = {}) => ({
+        token: resetHash('user-123', '123456'),
+        user_id: 'user-123',
+        expires_at: Date.now() + 3600000,
+        used: 0,
+        attempts: 0,
+        ...over,
+      });
+      const attemptUpdates = () =>
+        MockDb.mockPrepare.mock.calls.filter(
+          (call) => typeof call[0] === 'string' && (call[0] as string).includes('attempts = attempts + 1')
+        );
 
-        const result = userStore.validateResetToken('123456');
+      it('devrait valider un code valide', () => {
+        MockDb.mockGet.mockReturnValueOnce(userRow).mockReturnValueOnce(tokenRow());
+
+        const result = userStore.validateResetToken('user@example.com', '123456');
 
         expect(result.valid).toBe(true);
         expect(result.userId).toBe('user-123');
+        expect(result.tokenHash).toBe(resetHash('user-123', '123456'));
       });
 
-      it('devrait rejeter un token inexistant', () => {
+      it('devrait rejeter un code faux avec le message unique', () => {
+        MockDb.mockGet.mockReturnValueOnce(userRow).mockReturnValueOnce(tokenRow());
+
+        const result = userStore.validateResetToken('user@example.com', '654321');
+
+        expect(result.valid).toBe(false);
+        expect(result.error).toBe(userStore.RESET_CODE_INVALID_MESSAGE);
+      });
+
+      it('devrait rejeter un email inconnu', () => {
         MockDb.mockGet.mockReturnValueOnce(undefined);
 
-        const result = userStore.validateResetToken('invalid');
+        const result = userStore.validateResetToken('unknown@example.com', '123456');
 
         expect(result.valid).toBe(false);
-        expect(result.error).toBe('Code invalide');
+        expect(result.error).toBe(userStore.RESET_CODE_INVALID_MESSAGE);
       });
 
-      it('devrait rejeter un token déjà utilisé', () => {
-        MockDb.mockGet.mockReturnValueOnce({
-          user_id: 'user-123',
-          expires_at: Date.now() + 3600000,
-          used: 1,
-        });
+      it('devrait rejeter un utilisateur sans token', () => {
+        MockDb.mockGet.mockReturnValueOnce(userRow).mockReturnValueOnce(undefined);
 
-        const result = userStore.validateResetToken('123456');
+        const result = userStore.validateResetToken('user@example.com', '123456');
 
         expect(result.valid).toBe(false);
-        expect(result.error).toBe('Ce code a déjà été utilisé');
       });
 
-      it('devrait rejeter un token expiré', () => {
-        MockDb.mockGet.mockReturnValueOnce({
-          user_id: 'user-123',
-          expires_at: Date.now() - 1000,
-          used: 0,
-        });
+      it('devrait rejeter après 5 tentatives sans incrémenter', () => {
+        MockDb.mockGet.mockReturnValueOnce(userRow).mockReturnValueOnce(tokenRow({ attempts: 5 }));
 
-        const result = userStore.validateResetToken('123456');
+        const result = userStore.validateResetToken('user@example.com', '123456');
 
         expect(result.valid).toBe(false);
-        expect(result.error).toBe('Ce code a expiré');
+        expect(result.error).toBe(userStore.RESET_CODE_INVALID_MESSAGE);
+        expect(attemptUpdates()).toHaveLength(0);
+      });
+
+      it('devrait rejeter un code expiré', () => {
+        MockDb.mockGet.mockReturnValueOnce(userRow).mockReturnValueOnce(tokenRow({ expires_at: Date.now() - 1000 }));
+
+        const result = userStore.validateResetToken('user@example.com', '123456');
+
+        expect(result.valid).toBe(false);
+        expect(result.error).toBe(userStore.RESET_CODE_INVALID_MESSAGE);
+      });
+
+      it('devrait rejeter un code déjà utilisé', () => {
+        MockDb.mockGet.mockReturnValueOnce(userRow).mockReturnValueOnce(tokenRow({ used: 1 }));
+
+        const result = userStore.validateResetToken('user@example.com', '123456');
+
+        expect(result.valid).toBe(false);
+        expect(result.error).toBe(userStore.RESET_CODE_INVALID_MESSAGE);
+      });
+
+      it('devrait rejeter un code non numérique sans requête', () => {
+        const result = userStore.validateResetToken('user@example.com', '12ab56');
+
+        expect(result.valid).toBe(false);
+        expect(MockDb.mockPrepare).not.toHaveBeenCalled();
+        expect(MockDb.mockGet).not.toHaveBeenCalled();
+      });
+
+      it('devrait incrémenter les tentatives pour un code faux et pour un code juste', () => {
+        MockDb.mockGet.mockReturnValueOnce(userRow).mockReturnValueOnce(tokenRow());
+        userStore.validateResetToken('user@example.com', '000000');
+        expect(attemptUpdates()).toHaveLength(1);
+
+        MockDb.mockGet.mockReturnValueOnce(userRow).mockReturnValueOnce(tokenRow());
+        userStore.validateResetToken('user@example.com', '123456');
+        expect(attemptUpdates()).toHaveLength(2);
       });
     });
 
     describe('resetPassword', () => {
-      it('devrait réinitialiser le mot de passe avec un token valide', async () => {
-        MockDb.mockGet.mockReturnValueOnce({
-          user_id: 'user-123',
-          expires_at: Date.now() + 3600000,
-          used: 0,
-        });
-
-        const result = await userStore.resetPassword('abc123def456', 'newpassword123');
-
-        expect(result.success).toBe(true);
+      const userRow = { id: 'user-123', name: 'U' };
+      const validToken = () => ({
+        token: resetHash('user-123', '123456'),
+        user_id: 'user-123',
+        expires_at: Date.now() + 3600000,
+        used: 0,
+        attempts: 0,
       });
 
-      it('devrait échouer avec un mot de passe trop court', async () => {
-        MockDb.mockGet.mockReturnValueOnce({
-          user_id: 'user-123',
-          expires_at: Date.now() + 3600000,
-          used: 0,
-        });
+      it('devrait réinitialiser le mot de passe avec un code valide et révoquer les sessions', async () => {
+        MockDb.mockGet.mockReturnValueOnce(userRow).mockReturnValueOnce(validToken());
 
-        const result = await userStore.resetPassword('abc123def456', '1234567');
+        const result = await userStore.resetPassword('user@example.com', '123456', 'newpassword123');
+
+        expect(result.success).toBe(true);
+        const sqls = MockDb.mockPrepare.mock.calls.map((call) => String(call[0]));
+        expect(sqls.some((sql) => sql.includes('DELETE FROM session_tokens WHERE user_id'))).toBe(true);
+        expect(sqls.some((sql) => sql.includes('UPDATE password_reset_tokens SET used = 1'))).toBe(true);
+      });
+
+      it('devrait refuser sans modifier le mot de passe si le code a déjà été réclamé (changes === 0)', async () => {
+        MockDb.mockGet.mockReturnValueOnce(userRow).mockReturnValueOnce(validToken());
+        // 1er run = incrément des tentatives (validateResetToken), 2e run = réclamation du code : 0 ligne modifiée
+        MockDb.mockRun.mockReturnValueOnce({ changes: 1 }).mockReturnValueOnce({ changes: 0 });
+
+        const result = await userStore.resetPassword('user@example.com', '123456', 'newpassword123');
+
+        expect(result.success).toBe(false);
+        expect(result.error).toBe(userStore.RESET_CODE_INVALID_MESSAGE);
+        const sqls = MockDb.mockPrepare.mock.calls.map((call) => String(call[0]));
+        expect(sqls.some((sql) => sql.includes('SET used = 1 WHERE token = ? AND used = 0'))).toBe(true);
+        expect(sqls.some((sql) => sql.includes('UPDATE users SET password_hash'))).toBe(false);
+        expect(sqls.some((sql) => sql.includes('DELETE FROM session_tokens'))).toBe(false);
+      });
+
+      it('devrait désassocier les sockets du compte après un reset', async () => {
+        userStore.setSocketAccount('reset-sock-1', 'user-123');
+        MockDb.mockGet.mockReturnValueOnce(userRow).mockReturnValueOnce(validToken());
+
+        await userStore.resetPassword('user@example.com', '123456', 'newpassword123');
+
+        expect(userStore.getSocketAccount('reset-sock-1')).toBeUndefined();
+      });
+
+      it('devrait échouer avec un mot de passe trop court sans lire le token', async () => {
+        const result = await userStore.resetPassword('user@example.com', '123456', '1234567');
 
         expect(result.success).toBe(false);
         expect(result.error).toBe('Le mot de passe doit faire entre 8 et 256 caractères');
+        expect(MockDb.mockGet).not.toHaveBeenCalled();
       });
 
-      it('devrait échouer avec un token invalide', async () => {
+      it('devrait échouer avec un code invalide', async () => {
         MockDb.mockGet.mockReturnValueOnce(undefined);
 
-        const result = await userStore.resetPassword('invalid', 'newpassword123');
+        const result = await userStore.resetPassword('unknown@example.com', '123456', 'newpassword123');
 
         expect(result.success).toBe(false);
-        expect(result.error).toBe('Code invalide');
+        expect(result.error).toBe(userStore.RESET_CODE_INVALID_MESSAGE);
+      });
+    });
+
+    describe('clearSocketAccountsForUser', () => {
+      it('devrait supprimer uniquement les sockets du compte donné', () => {
+        userStore.setSocketAccount('csa-1', 'csa-user-a');
+        userStore.setSocketAccount('csa-2', 'csa-user-a');
+        userStore.setSocketAccount('csa-3', 'csa-user-b');
+
+        expect(userStore.clearSocketAccountsForUser('csa-user-a')).toBe(2);
+
+        expect(userStore.getSocketAccount('csa-1')).toBeUndefined();
+        expect(userStore.getSocketAccount('csa-2')).toBeUndefined();
+        expect(userStore.getSocketAccount('csa-3')).toBe('csa-user-b');
+        userStore.clearSocketAccount('csa-3');
+      });
+    });
+
+    describe('login avec compte inconnu', () => {
+      it('ne mémoïse pas un hash factice rejeté (pas d\'oracle « Erreur serveur »)', async () => {
+        vi.resetModules();
+        const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+        // Le précalcul au chargement du module échoue une fois
+        const hashSpy = vi.spyOn(bcrypt, 'hash').mockRejectedValueOnce(new Error('bcrypt KO') as never);
+        const compareSpy = vi.spyOn(bcrypt, 'compare').mockResolvedValue(false as never);
+        const fresh = await import('../../../server/store/userStore');
+        await new Promise((resolve) => setImmediate(resolve));
+
+        const result = await fresh.login('unknown@example.com', 'whatever123');
+
+        expect(result).toEqual({ success: false, error: 'Email ou mot de passe incorrect' });
+        expect(hashSpy).toHaveBeenCalledTimes(2);
+        expect(compareSpy).toHaveBeenCalledTimes(1);
+        fresh.stopCleanupInterval();
+        errorSpy.mockRestore();
+        hashSpy.mockRestore();
+        compareSpy.mockRestore();
+      });
+
+
+      it('devrait exécuter un bcrypt.compare factice (égalisation du timing)', async () => {
+        const compareSpy = vi.spyOn(bcrypt, 'compare').mockResolvedValue(false as never);
+        MockDb.mockGet.mockReturnValueOnce(undefined);
+
+        const result = await userStore.login('unknown@example.com', 'whatever123');
+
+        expect(result.success).toBe(false);
+        expect(result.error).toBe('Email ou mot de passe incorrect');
+        expect(compareSpy).toHaveBeenCalledTimes(1);
+        compareSpy.mockRestore();
       });
     });
   });
@@ -1585,6 +1738,29 @@ describe('userStore', () => {
     });
   });
 
+  describe('closeAllActiveRoomHistories', () => {
+    it('clôt tous les historiques actifs et retourne le nombre de lignes modifiées', () => {
+      MockDb.mockRun.mockReturnValueOnce({ changes: 3 });
+
+      const closed = userStore.closeAllActiveRoomHistories(123456);
+
+      expect(closed).toBe(3);
+      const sql = MockDb.mockPrepare.mock.calls
+        .map((c: unknown[]) => String(c[0]))
+        .find((q: string) => q.includes('is_active = 0') && q.includes('WHERE is_active = 1'));
+      expect(sql).toBeDefined();
+      expect(sql).toContain('COALESCE(closed_at, ?)');
+      expect(MockDb.mockRun).toHaveBeenCalledWith(123456);
+    });
+
+    it('utilise Date.now() par défaut', () => {
+      const spy = vi.spyOn(Date, 'now').mockReturnValue(999);
+      userStore.closeAllActiveRoomHistories();
+      expect(MockDb.mockRun).toHaveBeenCalledWith(999);
+      spy.mockRestore();
+    });
+  });
+
   describe('Deck & Table Config', () => {
     describe('getDeckConfig', () => {
       it('devrait retourner le deck parsé', () => {
@@ -1833,87 +2009,96 @@ describe('userStore', () => {
     });
 
     describe('validateResetToken', () => {
-      it('devrait valider un token existant et non expiré', () => {
-        MockDb.mockGet.mockReturnValueOnce({
-          user_id: 'user-verify',
-          expires_at: Date.now() + 60000,
-          used: 0,
-        });
+      it('devrait valider un code existant et non expiré', () => {
+        MockDb.mockGet
+          .mockReturnValueOnce({ id: 'user-verify', name: 'V' })
+          .mockReturnValueOnce({
+            token: resetHash('user-verify', '123456'),
+            user_id: 'user-verify',
+            expires_at: Date.now() + 60000,
+            used: 0,
+            attempts: 0,
+          });
 
-        const result = userStore.validateResetToken('123456');
+        const result = userStore.validateResetToken('verify@example.com', '123456');
 
         expect(result.valid).toBe(true);
         expect(result.userId).toBe('user-verify');
       });
 
-      it('devrait retourner invalide pour un token inexistant', () => {
+      it('devrait retourner invalide pour un utilisateur inexistant', () => {
         MockDb.mockGet.mockReturnValueOnce(undefined);
 
-        const result = userStore.validateResetToken('000000');
+        const result = userStore.validateResetToken('nobody@example.com', '000000');
 
         expect(result.valid).toBe(false);
-        expect(result.error).toContain('invalide');
+        expect(result.error).toBe(userStore.RESET_CODE_INVALID_MESSAGE);
       });
 
-      it('devrait retourner invalide pour un token déjà utilisé', () => {
-        MockDb.mockGet.mockReturnValueOnce({
-          user_id: 'user-used',
-          expires_at: Date.now() + 60000,
-          used: 1,
-        });
+      it('devrait retourner invalide pour un code déjà utilisé', () => {
+        MockDb.mockGet
+          .mockReturnValueOnce({ id: 'user-used', name: 'U' })
+          .mockReturnValueOnce({
+            token: resetHash('user-used', '123456'),
+            user_id: 'user-used',
+            expires_at: Date.now() + 60000,
+            used: 1,
+            attempts: 0,
+          });
 
-        const result = userStore.validateResetToken('123456');
+        const result = userStore.validateResetToken('used@example.com', '123456');
 
         expect(result.valid).toBe(false);
-        expect(result.error).toContain('utilisé');
+        expect(result.error).toBe(userStore.RESET_CODE_INVALID_MESSAGE);
       });
 
-      it('devrait retourner invalide pour un token expiré', () => {
-        MockDb.mockGet.mockReturnValueOnce({
-          user_id: 'user-expired',
-          expires_at: Date.now() - 1000,
-          used: 0,
-        });
+      it('devrait retourner invalide pour un code expiré', () => {
+        MockDb.mockGet
+          .mockReturnValueOnce({ id: 'user-expired', name: 'E' })
+          .mockReturnValueOnce({
+            token: resetHash('user-expired', '123456'),
+            user_id: 'user-expired',
+            expires_at: Date.now() - 1000,
+            used: 0,
+            attempts: 0,
+          });
 
-        const result = userStore.validateResetToken('123456');
+        const result = userStore.validateResetToken('expired@example.com', '123456');
 
         expect(result.valid).toBe(false);
-        expect(result.error).toContain('expiré');
+        expect(result.error).toBe(userStore.RESET_CODE_INVALID_MESSAGE);
       });
     });
 
     describe('resetPassword', () => {
-      it('devrait réinitialiser le mot de passe avec un token valide', async () => {
-        // Mock validateResetToken returns valid
-        MockDb.mockGet.mockReturnValueOnce({
-          user_id: 'user-reset',
-          expires_at: Date.now() + 60000,
-          used: 0,
-        });
+      it('devrait réinitialiser le mot de passe avec un code valide', async () => {
+        MockDb.mockGet
+          .mockReturnValueOnce({ id: 'user-reset', name: 'R' })
+          .mockReturnValueOnce({
+            token: resetHash('user-reset', '123456'),
+            user_id: 'user-reset',
+            expires_at: Date.now() + 60000,
+            used: 0,
+            attempts: 0,
+          });
 
-        const result = await userStore.resetPassword('123456', 'newpassword123');
+        const result = await userStore.resetPassword('reset@example.com', '123456', 'newpassword123');
 
         expect(result.success).toBe(true);
         expect(MockDb.mockRun).toHaveBeenCalled();
       });
 
-      it('devrait échouer avec un token invalide', async () => {
+      it('devrait échouer avec un code invalide', async () => {
         MockDb.mockGet.mockReturnValueOnce(undefined);
 
-        const result = await userStore.resetPassword('000000', 'newpassword123');
+        const result = await userStore.resetPassword('nobody@example.com', '000000', 'newpassword123');
 
         expect(result.success).toBe(false);
         expect(result.error).toContain('invalide');
       });
 
       it('devrait échouer avec un mot de passe trop court', async () => {
-        MockDb.mockGet.mockReturnValueOnce({
-          user_id: 'user-reset',
-          expires_at: Date.now() + 60000,
-          used: 0,
-        });
-
-        const result = await userStore.resetPassword('123456', 'short');
+        const result = await userStore.resetPassword('reset@example.com', '123456', 'short');
 
         expect(result.success).toBe(false);
         expect(result.error).toContain('8');

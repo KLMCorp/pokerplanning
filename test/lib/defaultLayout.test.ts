@@ -4,6 +4,7 @@ import {
   DEFAULT_LAYOUT,
   MAX_PER_ROW,
   mergeLayoutWithDefaults,
+  getRowGridClass,
 } from '../../src/lib/defaultLayout';
 
 describe('defaultLayout', () => {
@@ -193,6 +194,29 @@ describe('defaultLayout', () => {
         expect(allPanels.filter(id => id === 'pokerTable')).toHaveLength(1);
         expect(allPanels.filter(id => id === 'cardPicker')).toHaveLength(1);
       });
+    });
+  });
+
+  describe('getRowGridClass', () => {
+    const cases: Array<[string, Parameters<typeof getRowGridClass>[0], string]> = [
+      ['1 panneau', ['cardPicker'], 'grid-cols-1'],
+      ['2 panneaux sans table', ['controlsStats', 'userList'], 'grid-cols-1 md:grid-cols-2'],
+      ['2 panneaux, table en 0', ['pokerTable', 'userList'], 'grid-cols-1 md:grid-cols-[1fr_320px]'],
+      ['2 panneaux, table en 1', ['userList', 'pokerTable'], 'grid-cols-1 md:grid-cols-[320px_1fr]'],
+      ['3 panneaux sans table', ['cardPicker', 'controlsStats', 'userList'], 'grid-cols-1 lg:grid-cols-3'],
+      ['3 panneaux, table en 0', ['pokerTable', 'cardPicker', 'userList'], 'grid-cols-1 lg:grid-cols-[1fr_280px_280px]'],
+      ['3 panneaux, table en 1', ['cardPicker', 'pokerTable', 'userList'], 'grid-cols-1 lg:grid-cols-[280px_1fr_280px]'],
+      ['3 panneaux, table en 2', ['cardPicker', 'userList', 'pokerTable'], 'grid-cols-1 lg:grid-cols-[280px_280px_1fr]'],
+    ];
+
+    it.each(cases)('%s', (_label, row, expected) => {
+      expect(getRowGridClass(row)).toBe(expected);
+    });
+
+    it('toute classe retournée commence par grid-cols-1 (mobile : une colonne)', () => {
+      for (const [, row] of cases) {
+        expect(getRowGridClass(row).startsWith('grid-cols-1')).toBe(true);
+      }
     });
   });
 });

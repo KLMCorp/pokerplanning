@@ -46,6 +46,9 @@ server {
         proxy_set_header Connection "upgrade";
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
+        # Le serveur Node doit tourner avec TRUST_PROXY=1 (ce nginx est le seul proxy de confiance) :
+        # il lit l'adresse ajoutée à droite par $proxy_add_x_forwarded_for, non falsifiable par le client.
+        # Si un autre proxy/CDN est placé devant ce nginx, utiliser TRUST_PROXY=2.
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_read_timeout 86400;

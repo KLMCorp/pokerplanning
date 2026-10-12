@@ -4,7 +4,6 @@
  */
 
 import { UserAccount, UserRole, AuthType, RoomHistory, ItemHistory, DeckConfig, TableConfig, BacklogItem, AdminStats, SessionInfo, AdminUserAccount } from '../../src/types';
-import { v4 as uuidv4 } from 'uuid';
 import * as crypto from 'crypto';
 import bcrypt from 'bcrypt';
 
@@ -84,6 +83,30 @@ interface ResetTokenRow {
 
 // Nombre max de tentatives de validation d'un code de reset (anti brute-force global)
 const MAX_RESET_TOKEN_ATTEMPTS = 5;
+
+// Message unique pour tout échec de validation d'un code de reset (anti énumération)
+export const RESET_CODE_INVALID_MESSAGE = 'Code invalide ou expiré. Vous pouvez demander un nouveau code.';
+
+// Format d'email accepté (inscription et mot de passe oublié).
+// Labels de domaine sans '.' : aucun chevauchement entre quantificateurs, donc pas de backtracking (ReDoS)
+const EMAIL_REGEX = /^[^\s@]+@[^\s@.]+(?:\.[^\s@.]+)+$/;
+// Longueur max d'une adresse (RFC 5321), vérifiée avant la regex
+export const MAX_EMAIL_LENGTH = 254;
+
+export function isValidEmail(email: string): boolean {
+  return email.length <= MAX_EMAIL_LENGTH && EMAIL_REGEX.test(email);
+}
+
+/** Levée dans la transaction de reset quand le code a déjà été réclamé par une autre requête (rollback) */
+class ResetTokenAlreadyClaimedError extends Error {}
+
+/**
+ * Hash sha256 (hex) d'un code de reset, lié à l'utilisateur : `${userId}:${code}`.
+ * Seul ce hash est stocké en base, jamais le code en clair.
+ */
+function hashResetCode(userId: string, code: string): string {
+  return crypto.createHash('sha256').update(`${userId}:${code}`).digest('hex');
+}
 
 /** Row type for COUNT(*) aggregate queries */
 interface CountRow {
@@ -266,6 +289,15 @@ try {
   db.exec('ALTER TABLE password_reset_tokens ADD COLUMN attempts INTEGER DEFAULT 0');
 }
 
+// Migration : purger les anciens codes de reset stockés en clair (le hash sha256 fait 64 caractères)
+{
+  const purged = db.prepare('DELETE FROM password_reset_tokens WHERE length(token) <> 64').run();
+  const purgedCount = purged?.changes ?? 0;
+  if (purgedCount > 0) {
+    console.log(`Purged ${purgedCount} legacy password reset tokens`);
+  }
+}
+
 console.log(`SQLite database initialized at ${DB_FILE}`);
 
 // Nettoyage périodique des sessions expirées et des tokens de réinitialisation (toutes les 24h)
@@ -304,6 +336,23 @@ function safeJsonParse<T>(json: string | null | undefined): T | undefined {
 async function hashPassword(password: string): Promise<string> {
   return bcrypt.hash(password, BCRYPT_ROUNDS);
 }
+
+// Hash bcrypt factice (mémoïsé) : égalise le temps de réponse du login pour un compte inconnu
+let dummyHashPromise: Promise<string> | null = null;
+function getDummyPasswordHash(): Promise<string> {
+  if (!dummyHashPromise) {
+    const promise = bcrypt.hash('timing-equalization-dummy', BCRYPT_ROUNDS);
+    dummyHashPromise = promise;
+    // Une promesse rejetée ne doit pas rester mémoïsée (chaque login inconnu échouerait : oracle)
+    promise.catch(() => {
+      if (dummyHashPromise === promise) dummyHashPromise = null;
+    });
+  }
+  return dummyHashPromise;
+}
+
+// Précalcul au chargement du module (le premier login inconnu ne paie pas le coût du hash)
+getDummyPasswordHash().catch((e) => console.error('Failed to precompute dummy password hash', e));
 
 /**
  * Vérifie un mot de passe contre son hash bcrypt
@@ -360,8 +409,7 @@ export async function register(
     const normalizedEmail = email.toLowerCase().trim();
 
     // Valider l'email
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(normalizedEmail)) {
+    if (!isValidEmail(normalizedEmail)) {
       return { success: false, error: 'Email invalide' };
     }
 
@@ -374,7 +422,7 @@ export async function register(
     dbEmail = normalizedEmail;
   }
 
-  const userId = uuidv4();
+  const userId = crypto.randomUUID();
   const passwordHash = await hashPassword(password);
 
   try {
@@ -426,6 +474,8 @@ export async function login(
   `).get(lookupEmail) as UserRow | undefined;
 
   if (!user) {
+    // Compte inconnu : un bcrypt.compare factice égalise le temps de réponse (anti timing attack)
+    await bcrypt.compare(password, await getDummyPasswordHash());
     return { success: false, error: authType === 'pseudo' ? 'Pseudo ou mot de passe incorrect' : 'Email ou mot de passe incorrect' };
   }
 
@@ -510,6 +560,21 @@ export function getSocketAccount(socketId: string): string | undefined {
  */
 export function clearSocketAccount(socketId: string): void {
   socketToAccount.delete(socketId);
+}
+
+/**
+ * Désassocie tous les sockets d'un compte (ex. après un reset de mot de passe).
+ * Retourne le nombre d'associations supprimées.
+ */
+export function clearSocketAccountsForUser(userId: string): number {
+  let removed = 0;
+  for (const [socketId, accountId] of socketToAccount.entries()) {
+    if (accountId === userId) {
+      socketToAccount.delete(socketId);
+      removed++;
+    }
+  }
+  return removed;
 }
 
 // Durée de vie d'un token de session (30 jours)
@@ -604,7 +669,7 @@ export function addRoomToHistory(
   creatorName: string
 ): RoomHistory {
   const history: RoomHistory = {
-    id: uuidv4(),
+    id: crypto.randomUUID(),
     roomCode,
     createdAt: Date.now(),
     creatorId: accountId,
@@ -676,6 +741,20 @@ export function updateRoomHistory(
     values.push(history.id);
     db.prepare(`UPDATE room_histories SET ${setClauses.join(', ')} WHERE id = ?`).run(...values);
   }
+}
+
+/**
+ * Clôt tous les historiques encore actifs (les rooms sont en mémoire : elles sont perdues au redémarrage).
+ * Appelée uniquement au démarrage du serveur (server/index.ts), jamais au chargement du module.
+ * Retourne le nombre d'historiques clos.
+ */
+export function closeAllActiveRoomHistories(now: number = Date.now()): number {
+  const result = db.prepare(`
+    UPDATE room_histories
+    SET is_active = 0, closed_at = COALESCE(closed_at, ?)
+    WHERE is_active = 1
+  `).run(now);
+  return result.changes;
 }
 
 /**
@@ -829,73 +908,103 @@ export function createPasswordResetToken(userId: string): string {
   // Supprimer les anciens tokens non utilisés pour cet utilisateur
   db.prepare('DELETE FROM password_reset_tokens WHERE user_id = ?').run(userId);
 
-  // Créer un code à 6 chiffres
-  const code = crypto.randomInt(100000, 999999).toString();
+  // Créer un code à 6 chiffres (100000 à 999999 inclus)
+  const code = crypto.randomInt(100000, 1000000).toString();
   const expiresAt = Date.now() + 60 * 60 * 1000; // 1 heure
 
   db.prepare(`
     INSERT INTO password_reset_tokens (token, user_id, expires_at)
     VALUES (?, ?, ?)
-  `).run(code, userId, expiresAt);
+  `).run(hashResetCode(userId, code), userId, expiresAt);
 
   return code;
 }
 
 /**
- * Valide un token de réinitialisation et retourne l'userId
- * Limite le nombre de tentatives à MAX_RESET_TOKEN_ATTEMPTS pour éviter le brute-force
+ * Valide un code de réinitialisation pour un email donné.
+ * Le code est recherché par utilisateur (hash sha256(userId:code)) ; chaque essai qui atteint
+ * la comparaison est compté (MAX_RESET_TOKEN_ATTEMPTS max). Un seul message d'échec est retourné,
+ * quelle que soit la cause (email inconnu, code faux, expiré, utilisé, trop d'essais).
  */
-export function validateResetToken(token: string): { valid: boolean; userId?: string; error?: string } {
+export function validateResetToken(
+  email: string,
+  code: string
+): { valid: boolean; userId?: string; tokenHash?: string; error?: string } {
+  const invalid = { valid: false, error: RESET_CODE_INVALID_MESSAGE };
+
+  if (typeof email !== 'string' || typeof code !== 'string' || !/^\d{6}$/.test(code)) {
+    return invalid;
+  }
+
+  const user = findUserByEmail(email);
+  if (!user) return invalid;
+
   const row = db.prepare(`
-    SELECT user_id, expires_at, used, attempts FROM password_reset_tokens WHERE token = ?
-  `).get(token) as ResetTokenRow | undefined;
+    SELECT token, user_id, expires_at, used, attempts FROM password_reset_tokens
+    WHERE user_id = ? ORDER BY expires_at DESC LIMIT 1
+  `).get(user.id) as ResetTokenRow | undefined;
 
-  if (!row) {
-    // Incrémenter les tentatives sur tous les tokens non utilisés de cet utilisateur serait idéal,
-    // mais sans connaître l'utilisateur, on ne peut rien faire ici.
-    return { valid: false, error: 'Code invalide' };
+  if (!row) return invalid;
+
+  // États terminaux : aucun incrément
+  if (row.used === 1 || Date.now() > row.expires_at || (row.attempts ?? 0) >= MAX_RESET_TOKEN_ATTEMPTS) {
+    return invalid;
   }
 
-  // Incrémenter le compteur de tentatives à chaque validation (même si échouée)
-  db.prepare('UPDATE password_reset_tokens SET attempts = attempts + 1 WHERE token = ?').run(token);
+  // Toute tentative est comptée, avant la comparaison
+  db.prepare('UPDATE password_reset_tokens SET attempts = attempts + 1 WHERE token = ?').run(row.token);
 
-  if (row.used === 1) {
-    return { valid: false, error: 'Ce code a déjà été utilisé' };
-  }
+  const expected = Buffer.from(row.token, 'hex');
+  const candidate = Buffer.from(hashResetCode(user.id, code), 'hex');
+  const ok = expected.length === candidate.length && crypto.timingSafeEqual(expected, candidate);
 
-  if ((row.attempts || 0) >= MAX_RESET_TOKEN_ATTEMPTS) {
-    return { valid: false, error: 'Trop de tentatives, veuillez redemander un code' };
-  }
-
-  if (Date.now() > row.expires_at) {
-    return { valid: false, error: 'Ce code a expiré' };
-  }
-
-  return { valid: true, userId: row.user_id };
+  return ok ? { valid: true, userId: user.id, tokenHash: row.token } : invalid;
 }
 
 /**
- * Réinitialise le mot de passe avec un token valide
- * Utilise une transaction pour garantir l'atomicité (update pwd + mark token used)
+ * Réinitialise le mot de passe avec un code valide pour l'email donné
+ * Utilise une transaction pour garantir l'atomicité (update pwd + code utilisé + sessions révoquées)
  */
-export async function resetPassword(token: string, newPassword: string): Promise<{ success: boolean; error?: string }> {
-  const validation = validateResetToken(token);
-  if (!validation.valid) {
-    return { success: false, error: validation.error };
-  }
-
-  if (newPassword.length < 8 || newPassword.length > 256) {
+export async function resetPassword(
+  email: string,
+  code: string,
+  newPassword: string
+): Promise<{ success: boolean; error?: string }> {
+  // La longueur est vérifiée d'abord : un mot de passe invalide ne consomme pas de tentative
+  if (typeof newPassword !== 'string' || newPassword.length < 8 || newPassword.length > 256) {
     return { success: false, error: 'Le mot de passe doit faire entre 8 et 256 caractères' };
   }
 
+  const validation = validateResetToken(email, code);
+  if (!validation.valid || !validation.userId) {
+    return { success: false, error: validation.error };
+  }
+  const userId = validation.userId;
+
   const passwordHash = await hashPassword(newPassword);
 
-  // Transaction atomique : update mot de passe + marquer le token comme utilisé
+  // Transaction atomique : le code est réclamé (used = 0 -> 1) avant toute modification, puis mot de passe
+  // mis à jour et sessions révoquées. Deux requêtes simultanées avec le bon code : une seule réclame le code.
+  // Un échec du hash bcrypt (plus haut) ne consomme donc pas le code.
   const resetTransaction = db.transaction(() => {
-    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(passwordHash, validation.userId);
-    db.prepare('UPDATE password_reset_tokens SET used = 1 WHERE token = ?').run(token);
+    const claim = db.prepare('UPDATE password_reset_tokens SET used = 1 WHERE token = ? AND used = 0').run(validation.tokenHash);
+    if (claim.changes === 0) {
+      throw new ResetTokenAlreadyClaimedError();
+    }
+    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(passwordHash, userId);
+    db.prepare('DELETE FROM session_tokens WHERE user_id = ?').run(userId);
   });
-  resetTransaction();
+  try {
+    resetTransaction();
+  } catch (e) {
+    if (e instanceof ResetTokenAlreadyClaimedError) {
+      return { success: false, error: RESET_CODE_INVALID_MESSAGE };
+    }
+    throw e;
+  }
+
+  // Les sockets déjà authentifiés (autres onglets) perdent leur association serveur
+  clearSocketAccountsForUser(userId);
 
   return { success: true };
 }
@@ -960,7 +1069,7 @@ export function createBacklogItem(
   title: string,
   description?: string
 ): BacklogItem | null {
-  const id = uuidv4();
+  const id = crypto.randomUUID();
   const now = Date.now();
 
   try {

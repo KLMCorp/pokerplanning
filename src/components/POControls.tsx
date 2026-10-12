@@ -9,6 +9,8 @@ import { useState, useMemo, useCallback, useEffect } from 'react';
 import { useTranslations } from 'next-intl';
 import { useRoom } from '@/hooks/useRoom';
 import TimerControls from './TimerControls';
+import DeckSettings from './DeckSettings';
+import { useRuntimeConfig } from '@/contexts/RuntimeConfigContext';
 
 export default function POControls() {
   const t = useTranslations('poControls');
@@ -31,6 +33,8 @@ export default function POControls() {
   } = useRoom();
 
   const [customScore, setCustomScore] = useState('');
+  const [showDeckSettings, setShowDeckSettings] = useState(false);
+  const { allowUploads } = useRuntimeConfig();
 
   // Valeurs numériques du deck triées (mémorisées)
   const deckValues = useMemo(() =>
@@ -252,12 +256,23 @@ export default function POControls() {
             />
           </button>
         </label>
+        {allowUploads && (
+          <button
+            type="button"
+            onClick={() => setShowDeckSettings(true)}
+            className="mt-2 w-full text-sm py-1.5 px-3 rounded-lg bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600 transition-colors"
+          >
+            {t('customizeCards')}
+          </button>
+        )}
       </div>
 
       {/* Chronomètre */}
       <div className="mt-4 pt-3 border-t border-gray-200 dark:border-gray-700">
         <TimerControls />
       </div>
+
+      {showDeckSettings && <DeckSettings onClose={() => setShowDeckSettings(false)} />}
     </div>
   );
 }

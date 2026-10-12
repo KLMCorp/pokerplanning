@@ -42,7 +42,7 @@ export const AVATAR_COLORS = [
  * Obtient un avatar aleatoire base sur un seed (userId)
  */
 export function getAvatarForUser(userId: string): { emoji: string; color: string } {
-  // Utilise le oderId comme seed pour avoir toujours le meme avatar
+  // Utilise le userId comme seed pour avoir toujours le meme avatar
   let hash = 0;
   for (let i = 0; i < userId.length; i++) {
     const char = userId.charCodeAt(i);

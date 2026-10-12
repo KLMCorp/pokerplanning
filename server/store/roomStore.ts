@@ -3,10 +3,10 @@
  * Stocke toutes les données des rooms de Planning Poker
  */
 
-import { Room, User, Item, Vote, DeckConfig, RoomState, RoomSettings, TableConfig, ItemHistory } from '../../src/types';
-import { v4 as uuidv4 } from 'uuid';
+import { Room, User, Item, Vote, DeckConfig, RoomState, RoomSettings, TableConfig, ItemHistory, AdminActiveRoomSummary } from '../../src/types';
 import * as crypto from 'crypto';
 import * as userStore from './userStore';
+import { ROOM_CODE_ALPHABET, ROOM_CODE_LENGTH } from '../utils/roomCode';
 
 // Couleur de carte par défaut (bleu)
 const DEFAULT_CARD_COLOR = '#3B82F6';
@@ -83,6 +83,119 @@ const reconnectSecrets: Map<string, string> = new Map();
 // Cache créateur de room (roomId -> accountId) pour éviter les requêtes SQLite répétées
 const roomCreators: Map<string, string> = new Map();
 
+// Début RÉEL (Date.now()) du segment de chrono en cours, par room.
+// timerStartedAt reste fictif (calé pour le calcul client) : il ne sert pas à mesurer le temps écoulé.
+const timerSegments: Map<string, number> = new Map();
+
+/**
+ * Raison de suppression d'une room
+ */
+export type RoomRemovalReason = 'po_left' | 'po_disconnected' | 'empty' | 'expired';
+
+/**
+ * Événement émis au listener quand une room est supprimée
+ * (userIds = utilisateurs présents dans la room au moment de la suppression)
+ */
+export interface RoomRemovedEvent {
+  roomId: string;
+  reason: RoomRemovalReason;
+  userIds: string[];
+}
+
+// Listener unique de suppression de room (enregistré par handlers.ts)
+let roomRemovedListener: ((e: RoomRemovedEvent) => void) | null = null;
+
+/**
+ * Enregistre le listener appelé après chaque suppression de room (un seul : le dernier gagne)
+ */
+export function setRoomRemovedListener(listener: ((e: RoomRemovedEvent) => void) | null): void {
+  roomRemovedListener = listener;
+}
+
+/**
+ * Supprime une clé de pending disconnect et le Set de la room s'il devient vide
+ */
+function removePendingKey(roomId: string, key: string): void {
+  pendingDisconnects.delete(key);
+  const set = pendingDisconnectsByRoom.get(roomId);
+  if (set) {
+    set.delete(key);
+    if (set.size === 0) {
+      pendingDisconnectsByRoom.delete(roomId);
+    }
+  }
+}
+
+/**
+ * Construit l'historique des items estimés d'une room
+ * Utilisé lors de la sauvegarde de l'historique (fermeture, départ, score final, etc.)
+ */
+export function buildItemHistories(room: Room): ItemHistory[] {
+  return room.items
+    .filter((item) => item.finalScore)
+    .map((item) => ({
+      id: item.id,
+      title: item.title,
+      description: item.description,
+      finalScore: item.finalScore,
+      votes: Object.entries(item.votes).reduce((acc, [voterId, vote]) => {
+        const voter = room.users[voterId];
+        acc[voterId] = {
+          voterName: voter?.name || 'Inconnu',
+          value: vote.value,
+        };
+        return acc;
+      }, {} as Record<string, { voterName: string; value: string }>),
+    }));
+}
+
+/**
+ * Point unique de suppression d'une room : clôt l'historique AVANT d'effacer
+ * roomCreators, nettoie toute la mémoire associée, puis notifie le listener.
+ */
+function deleteRoomState(roomId: string, reason: RoomRemovalReason): void {
+  const room = rooms.get(roomId);
+  if (!room) return;
+
+  const now = Date.now();
+  const creator = roomCreators.get(roomId);
+  const userIds = Object.keys(room.users);
+
+  if (creator) {
+    // Un échec SQLite (lecture seule, disque plein, BUSY) ne doit pas bloquer le nettoyage mémoire
+    try {
+      userStore.updateRoomHistory(creator, roomId, {
+        items: buildItemHistories(room),
+        isActive: false,
+        closedAt: now,
+        participantCount: reason === 'empty' ? 0 : userIds.length,
+      });
+    } catch (e) {
+      console.error(`[Room] history close failed for ${roomId}`, e);
+    }
+  }
+
+  removeAllSocketsForRoom(roomId);
+  for (const uid of userIds) {
+    reconnectSecrets.delete(`${roomId}:${uid}`);
+  }
+  for (const k of pendingDisconnectsByRoom.get(roomId) ?? []) {
+    pendingDisconnects.delete(k);
+  }
+  pendingDisconnectsByRoom.delete(roomId);
+  timerSegments.delete(roomId);
+
+  rooms.delete(roomId);
+  roomPasswords.delete(roomId);
+  roomCreators.delete(roomId);
+
+  try {
+    roomRemovedListener?.({ roomId, reason, userIds });
+  } catch (e) {
+    console.error('[Room] removal listener failed', e);
+  }
+}
+
 /**
  * Ajoute une association socket -> user et met à jour l'index inversé
  */
@@ -127,15 +240,15 @@ function removeAllSocketsForRoom(roomId: string): void {
 }
 
 /**
- * Génère un code de room unique (6 caractères alphanumériques)
+ * Génère un code de room unique (ROOM_CODE_LENGTH caractères de ROOM_CODE_ALPHABET)
  * Utilise crypto.randomInt pour une génération cryptographiquement sécurisée
  */
 function generateRoomCode(): string {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const chars = ROOM_CODE_ALPHABET;
   let code = '';
   do {
     code = '';
-    for (let i = 0; i < 6; i++) {
+    for (let i = 0; i < ROOM_CODE_LENGTH; i++) {
       code += chars.charAt(crypto.randomInt(chars.length));
     }
   } while (rooms.has(code));
@@ -167,7 +280,7 @@ function verifyRoomPassword(password: string, roomId: string, storedHash: string
  */
 export function createRoom(poName: string, socketId: string, password?: string, customDeck?: DeckConfig, customTable?: TableConfig, userCardBackUrl?: string, ttlMinutes?: number, cardColor?: string): { room: Room; userId: string; reconnectSecret: string } {
   const roomId = generateRoomCode();
-  const userId = uuidv4();
+  const userId = crypto.randomUUID();
 
   const poUser: User = {
     id: userId,
@@ -179,8 +292,13 @@ export function createRoom(poName: string, socketId: string, password?: string, 
 
   const hasPassword = !!password && password.trim().length > 0;
 
-  // Utilise le deck personnalisé si fourni, sinon le deck par défaut
-  const deckToUse = customDeck ? JSON.parse(JSON.stringify(customDeck)) : { ...DEFAULT_DECK };
+  // Utilise le deck personnalisé si fourni, sinon le deck par défaut.
+  // Le dos du compte reste le dos personnel du PO (poUser.cardBackUrl) : room.deck.backImageUrl
+  // n'est défini que par DeckSettings, sinon la règle « dos de room > dos utilisateur »
+  // imposerait le dos personnel du PO à tous les participants.
+  const deckToUse = customDeck
+    ? { ...JSON.parse(JSON.stringify(customDeck)), backImageUrl: undefined }
+    : structuredClone(DEFAULT_DECK); // copie profonde : les handlers mutent les cartes (frontImageUrl)
 
   // Calcul du TTL
   const effectiveTtl = ttlMinutes && ttlMinutes > 0 ? Math.min(ttlMinutes, DEFAULT_ROOM_TTL_MINUTES) : DEFAULT_ROOM_TTL_MINUTES;
@@ -217,6 +335,43 @@ export function createRoom(poName: string, socketId: string, password?: string, 
 }
 
 /**
+ * Vérifie qu'une room peut être rejointe (existence, mot de passe, capacité)
+ * sans aucun effet de bord : permet de valider la cible avant de quitter l'ancienne room.
+ */
+export function checkJoinable(roomId: string, password?: string): { ok: true } | { ok: false; error: string } {
+  const room = rooms.get(roomId);
+
+  if (!room) {
+    return { ok: false, error: 'Room introuvable' };
+  }
+
+  // Vérifier le mot de passe si la room en a un (comparaison constant-time)
+  if (room.hasPassword) {
+    const storedHash = roomPasswords.get(roomId);
+    if (!password || !storedHash || !verifyRoomPassword(password, roomId, storedHash)) {
+      return { ok: false, error: 'Mot de passe incorrect' };
+    }
+  }
+
+  // Vérifier la limite de participants
+  if (MAX_PARTICIPANTS_PER_ROOM > 0) {
+    const currentCount = Object.keys(room.users).length;
+    if (currentCount >= MAX_PARTICIPANTS_PER_ROOM) {
+      return { ok: false, error: `La room est pleine (maximum ${MAX_PARTICIPANTS_PER_ROOM} participants)` };
+    }
+  }
+
+  return { ok: true };
+}
+
+/**
+ * Récupère le secret de reconnexion d'un utilisateur de room
+ */
+export function getReconnectSecret(roomId: string, userId: string): string | undefined {
+  return reconnectSecrets.get(`${roomId}:${userId}`);
+}
+
+/**
  * Rejoint une room existante
  */
 export function joinRoom(
@@ -227,29 +382,13 @@ export function joinRoom(
   userCardBackUrl?: string,
   cardColor?: string
 ): { success: boolean; room?: Room; userId?: string; error?: string; reconnectSecret?: string } {
-  const room = rooms.get(roomId);
-
-  if (!room) {
-    return { success: false, error: 'Room introuvable' };
+  const joinable = checkJoinable(roomId, password);
+  if (!joinable.ok) {
+    return { success: false, error: joinable.error };
   }
+  const room = rooms.get(roomId)!;
 
-  // Vérifier le mot de passe si la room en a un (comparaison constant-time)
-  if (room.hasPassword) {
-    const storedHash = roomPasswords.get(roomId);
-    if (!password || !storedHash || !verifyRoomPassword(password, roomId, storedHash)) {
-      return { success: false, error: 'Mot de passe incorrect' };
-    }
-  }
-
-  // Vérifier la limite de participants
-  if (MAX_PARTICIPANTS_PER_ROOM > 0) {
-    const currentCount = Object.keys(room.users).length;
-    if (currentCount >= MAX_PARTICIPANTS_PER_ROOM) {
-      return { success: false, error: `La room est pleine (maximum ${MAX_PARTICIPANTS_PER_ROOM} participants)` };
-    }
-  }
-
-  const userId = uuidv4();
+  const userId = crypto.randomUUID();
   const user: User = {
     id: userId,
     name: userName,
@@ -296,18 +435,8 @@ export function leaveRoom(socketId: string): { roomId?: string; userId?: string;
       items: room.items.map(i => ({ ...i, votes: { ...i.votes } })),
     };
 
-    // Nettoyer toutes les associations socket -> user pour cette room
-    removeAllSocketsForRoom(roomId);
-
-    // Nettoyer les secrets de reconnexion pour cette room
-    for (const uid of Object.keys(room.users)) {
-      reconnectSecrets.delete(`${roomId}:${uid}`);
-    }
-
-    // Supprimer la room
-    rooms.delete(roomId);
-    roomPasswords.delete(roomId);
-    roomCreators.delete(roomId);
+    // Suppression centralisée (historique, mémoire, notification)
+    deleteRoomState(roomId, 'po_left');
 
     return { roomId, userId, roomClosed: true, closedRoom };
   }
@@ -325,9 +454,7 @@ export function leaveRoom(socketId: string): { roomId?: string; userId?: string;
 
   // Si la room est vide, la supprimer
   if (Object.keys(room.users).length === 0) {
-    rooms.delete(roomId);
-    roomPasswords.delete(roomId);
-    roomCreators.delete(roomId);
+    deleteRoomState(roomId, 'empty');
     return { roomId, userId };
   }
 
@@ -386,7 +513,7 @@ export function createItem(
   if (!room) return null;
 
   const item: Item = {
-    id: uuidv4(),
+    id: crypto.randomUUID(),
     title,
     description,
     order: room.items.length,
@@ -478,14 +605,16 @@ export function selectItem(roomId: string, itemId: string): boolean {
   if (!item) return false;
 
   // Si on change d'item, flush elapsed time du timer sur l'ancien item
-  if (room.activeItemId !== itemId && room.activeItemId && room.timerStartedAt) {
-    const oldItem = room.items.find((i) => i.id === room.activeItemId);
-    if (oldItem) {
-      const elapsed = Date.now() - room.timerStartedAt;
-      oldItem.elapsedTime = (oldItem.elapsedTime || 0) + elapsed;
+  if (room.activeItemId !== itemId && room.timerStartedAt !== undefined) {
+    const now = Date.now();
+    if (room.activeItemId) {
+      // Ancien item : somme exacte du segment réel en cours
+      flushTimerSegment(room, now);
+      // Redémarrer le timer pour le nouvel item
+      room.timerStartedAt = now;
     }
-    // Redémarrer le timer pour le nouvel item
-    room.timerStartedAt = Date.now();
+    // Nouveau segment réel pour le nouvel item
+    timerSegments.set(roomId, now);
   }
 
   // Si on change d'item, reset les votes du nouvel item
@@ -600,6 +729,8 @@ export function transferPO(roomId: string, newPoUserId: string): boolean {
   const room = rooms.get(roomId);
   if (!room) return false;
 
+  // Object.hasOwn : la clé vient du client ('__proto__', 'constructor'… ne doivent pas résoudre)
+  if (!Object.hasOwn(room.users, newPoUserId)) return false;
   const newPo = room.users[newPoUserId];
   if (!newPo) return false;
 
@@ -633,12 +764,32 @@ const TIMER_MIN_MS = 10 * 1000;      // 10 secondes
 const TIMER_MAX_MS = 60 * 60 * 1000; // 60 minutes
 
 /**
+ * Ajoute à l'item actif le temps RÉEL écoulé depuis le début du segment de chrono en cours.
+ * Sans effet si aucun segment n'est en cours ou si le chrono est arrêté.
+ */
+function flushTimerSegment(room: Room, now: number): void {
+  const seg = timerSegments.get(room.id);
+  if (seg !== undefined && room.timerStartedAt !== undefined) {
+    const item = room.activeItemId ? room.items.find((i) => i.id === room.activeItemId) : undefined;
+    if (item) {
+      item.elapsedTime = (item.elapsedTime || 0) + (now - seg);
+    }
+  }
+}
+
+/**
  * Définit la durée du chronomètre (clamp entre 10s et 60min).
  * Reset automatiquement l'état du timer (arrêté, pas de remaining).
  */
 export function setTimerDuration(roomId: string, durationMs: number): boolean {
   const room = rooms.get(roomId);
   if (!room) return false;
+
+  // Si le chrono tournait, le segment en cours est comptabilisé avant la remise à zéro
+  if (room.timerStartedAt !== undefined) {
+    flushTimerSegment(room, Date.now());
+  }
+  timerSegments.delete(roomId);
 
   room.timerDuration = Math.max(TIMER_MIN_MS, Math.min(TIMER_MAX_MS, durationMs));
   room.timerStartedAt = undefined;
@@ -661,11 +812,14 @@ export function setTimerDuration(roomId: string, durationMs: number): boolean {
 export function startTimer(roomId: string): boolean {
   const room = rooms.get(roomId);
   if (!room || !room.timerDuration) return false;
-  if (room.timerStartedAt) return true; // déjà running
+  if (room.timerStartedAt !== undefined) return true; // déjà running
 
+  const now = Date.now();
   const remaining = room.timerStoppedRemaining ?? room.timerDuration;
-  room.timerStartedAt = Date.now() - (room.timerDuration - remaining);
+  room.timerStartedAt = now - (room.timerDuration - remaining);
   room.timerStoppedRemaining = undefined;
+  // Début réel du segment : timerStartedAt est fictif (reprise après pause)
+  timerSegments.set(roomId, now);
 
   return true;
 }
@@ -677,19 +831,15 @@ export function startTimer(roomId: string): boolean {
  */
 export function stopTimer(roomId: string): boolean {
   const room = rooms.get(roomId);
-  if (!room || !room.timerDuration || !room.timerStartedAt) return false;
+  if (!room || !room.timerDuration || room.timerStartedAt === undefined) return false;
 
-  const elapsed = Date.now() - room.timerStartedAt;
-  const base = room.timerStoppedRemaining ?? room.timerDuration;
-  room.timerStoppedRemaining = base - elapsed;
+  const now = Date.now();
+  // Remaining restant (équivalent au calcul client : duration - (now - startedAt))
+  room.timerStoppedRemaining = room.timerDuration - (now - room.timerStartedAt);
 
-  // Accumuler le temps écoulé sur l'item actif
-  if (room.activeItemId) {
-    const activeItem = room.items.find((i) => i.id === room.activeItemId);
-    if (activeItem) {
-      activeItem.elapsedTime = (activeItem.elapsedTime || 0) + elapsed;
-    }
-  }
+  // Accumuler sur l'item actif le temps réellement écoulé chrono en marche
+  flushTimerSegment(room, now);
+  timerSegments.delete(roomId);
 
   room.timerStartedAt = undefined;
 
@@ -703,6 +853,12 @@ export function stopTimer(roomId: string): boolean {
 export function resetTimer(roomId: string): boolean {
   const room = rooms.get(roomId);
   if (!room || !room.timerDuration) return false;
+
+  // Si le chrono tournait, le segment en cours est comptabilisé avant la remise à zéro
+  if (room.timerStartedAt !== undefined) {
+    flushTimerSegment(room, Date.now());
+  }
+  timerSegments.delete(roomId);
 
   room.timerStartedAt = undefined;
   room.timerStoppedRemaining = undefined;
@@ -751,6 +907,33 @@ export function markPendingDisconnect(socketId: string): { roomId: string; userI
 }
 
 /**
+ * Compare un secret de reconnexion fourni au secret stocké (constant-time, lecture seule)
+ */
+function isReconnectSecretValid(key: string, secret?: string): boolean {
+  const storedSecret = reconnectSecrets.get(key);
+  if (!storedSecret || !secret || storedSecret.length !== secret.length) {
+    return false;
+  }
+  try {
+    return crypto.timingSafeEqual(Buffer.from(storedSecret), Buffer.from(secret));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Vérifie en LECTURE SEULE qu'une demande de reconnexion est valide : déconnexion en attente,
+ * secret correct et utilisateur présent dans la room. Ne modifie aucun état.
+ */
+export function isValidReconnectRequest(roomId: string, userId: string, secret?: string): boolean {
+  const key = `${roomId}:${userId}`;
+  if (!pendingDisconnects.has(key)) return false;
+  if (!isReconnectSecretValid(key, secret)) return false;
+  const room = rooms.get(roomId);
+  return !!room && Object.hasOwn(room.users, userId);
+}
+
+/**
  * Annule une déconnexion en attente (l'utilisateur revient avec un nouveau socket).
  * Vérifie le secret de reconnexion pour empêcher le hijack de session.
  * Recrée l'entrée socketToUser et retourne la Room.
@@ -760,27 +943,15 @@ export function cancelPendingDisconnect(roomId: string, userId: string, newSocke
   if (!pendingDisconnects.has(key)) return undefined;
 
   // Vérifier le secret de reconnexion (comparaison constant-time)
-  const storedSecret = reconnectSecrets.get(key);
-  if (!storedSecret || !secret || storedSecret.length !== secret.length) {
-    return undefined;
-  }
-  try {
-    if (!crypto.timingSafeEqual(Buffer.from(storedSecret), Buffer.from(secret))) {
-      return undefined;
-    }
-  } catch {
-    return undefined;
-  }
+  if (!isReconnectSecretValid(key, secret)) return undefined;
 
   const room = rooms.get(roomId);
-  if (!room || !room.users[userId]) {
-    pendingDisconnects.delete(key);
-    pendingDisconnectsByRoom.get(roomId)?.delete(key);
+  if (!room || !Object.hasOwn(room.users, userId)) {
+    removePendingKey(roomId, key);
     return undefined;
   }
 
-  pendingDisconnects.delete(key);
-  pendingDisconnectsByRoom.get(roomId)?.delete(key);
+  removePendingKey(roomId, key);
   addSocketMapping(newSocketId, roomId, userId);
 
   return room;
@@ -792,12 +963,11 @@ export function cancelPendingDisconnect(roomId: string, userId: string, newSocke
  */
 export function executePendingDisconnect(roomId: string, userId: string): { room?: Room; roomClosed?: boolean; closedRoom?: Room } {
   const key = `${roomId}:${userId}`;
-  pendingDisconnects.delete(key);
-  pendingDisconnectsByRoom.get(roomId)?.delete(key);
+  removePendingKey(roomId, key);
   reconnectSecrets.delete(key);
 
   const room = rooms.get(roomId);
-  if (!room || !room.users[userId]) {
+  if (!room || !Object.hasOwn(room.users, userId)) {
     return {};
   }
 
@@ -810,26 +980,8 @@ export function executePendingDisconnect(roomId: string, userId: string): { room
       items: room.items.map(i => ({ ...i, votes: { ...i.votes } })),
     };
 
-    // Nettoyer toutes les associations socket -> user pour cette room
-    removeAllSocketsForRoom(roomId);
-
-    // Nettoyer les secrets de reconnexion pour cette room
-    for (const uid of Object.keys(room.users)) {
-      reconnectSecrets.delete(`${roomId}:${uid}`);
-    }
-
-    // Nettoyer les pending disconnects pour cette room via l'index inversé (O(1))
-    const roomPendingKeys = pendingDisconnectsByRoom.get(roomId);
-    if (roomPendingKeys) {
-      for (const k of roomPendingKeys) {
-        pendingDisconnects.delete(k);
-      }
-      pendingDisconnectsByRoom.delete(roomId);
-    }
-
-    rooms.delete(roomId);
-    roomPasswords.delete(roomId);
-    roomCreators.delete(roomId);
+    // Suppression centralisée (historique, mémoire, notification)
+    deleteRoomState(roomId, 'po_disconnected');
 
     return { roomClosed: true, closedRoom };
   }
@@ -844,9 +996,7 @@ export function executePendingDisconnect(roomId: string, userId: string): { room
 
   // Si la room est vide, la supprimer
   if (Object.keys(room.users).length === 0) {
-    rooms.delete(roomId);
-    roomPasswords.delete(roomId);
-    roomCreators.delete(roomId);
+    deleteRoomState(roomId, 'empty');
     return {};
   }
 
@@ -862,71 +1012,24 @@ export function cleanupExpiredRooms(): string[] {
   const now = Date.now();
 
   // 1. Collecter les rooms expirées
-  const expiredRooms: { roomId: string; room: Room }[] = [];
+  const expiredRoomIds: string[] = [];
   for (const [roomId, room] of rooms.entries()) {
     if (room.expiresAt && now > room.expiresAt) {
-      expiredRooms.push({ roomId, room });
+      expiredRoomIds.push(roomId);
     }
   }
 
-  if (expiredRooms.length === 0) return [];
+  if (expiredRoomIds.length === 0) return [];
 
-  const expiredRoomIds = expiredRooms.map(e => e.roomId);
-
-  // 2. Traiter chaque room expirée (créateur résolu depuis le cache mémoire)
-  for (const { roomId, room } of expiredRooms) {
-    const creatorAccountId = roomCreators.get(roomId);
-    if (creatorAccountId) {
-      const items: ItemHistory[] = room.items
-        .filter((item) => item.finalScore)
-        .map((item) => ({
-          id: item.id,
-          title: item.title,
-          description: item.description,
-          finalScore: item.finalScore,
-          votes: Object.entries(item.votes).reduce((acc, [oderId, vote]) => {
-            const voter = room.users[oderId];
-            acc[oderId] = {
-              voterName: voter?.name || 'Inconnu',
-              value: vote.value,
-            };
-            return acc;
-          }, {} as Record<string, { voterName: string; value: string }>),
-        }));
-
-      userStore.updateRoomHistory(creatorAccountId, roomId, {
-        items,
-        isActive: false,
-        closedAt: now,
-        participantCount: Object.keys(room.users).length,
-      });
-
-      console.log(`[TTL] Room ${roomId} history saved for user ${creatorAccountId}`);
+  // 2. Suppression centralisée (historique clos avec les mêmes arguments qu'avant, mémoire, notification)
+  // Chaque room est isolée : l'échec de l'une n'arrête pas les suivantes
+  for (const roomId of expiredRoomIds) {
+    try {
+      deleteRoomState(roomId, 'expired');
+      console.log(`[TTL] Room ${roomId} expired and cleaned up`);
+    } catch (e) {
+      console.error(`[TTL] cleanup failed for room ${roomId}`, e);
     }
-
-    // Nettoyer les associations socket -> user pour cette room
-    removeAllSocketsForRoom(roomId);
-
-    // Nettoyer les secrets de reconnexion pour cette room
-    for (const uid of Object.keys(room.users)) {
-      reconnectSecrets.delete(`${roomId}:${uid}`);
-    }
-
-    // Nettoyer les pending disconnects pour cette room via l'index inversé (O(1))
-    const roomPendingKeys = pendingDisconnectsByRoom.get(roomId);
-    if (roomPendingKeys) {
-      for (const k of roomPendingKeys) {
-        pendingDisconnects.delete(k);
-      }
-      pendingDisconnectsByRoom.delete(roomId);
-    }
-
-    // Supprimer la room et son mot de passe
-    rooms.delete(roomId);
-    roomPasswords.delete(roomId);
-    roomCreators.delete(roomId);
-
-    console.log(`[TTL] Room ${roomId} expired and cleaned up`);
   }
 
   return expiredRoomIds;
@@ -950,11 +1053,59 @@ export function getAllRooms(): Room[] {
   return Array.from(rooms.values());
 }
 
+/**
+ * Résumés des rooms actives pour le dashboard admin
+ */
+export function getActiveRoomSummaries(): AdminActiveRoomSummary[] {
+  return Array.from(rooms.values()).map((room) => ({
+    id: room.id,
+    poName: room.users[room.poUserId]?.name ?? null,
+    participants: Object.values(room.users).map((u) => ({ id: u.id, name: u.name, isPO: u.id === room.poUserId })),
+    userCount: Object.keys(room.users).length,
+    itemCount: room.items.length,
+    state: room.state,
+    hasPassword: room.hasPassword,
+    createdAt: room.createdAt,
+    expiresAt: room.expiresAt,
+  }));
+}
+
+/**
+ * Taille des structures en mémoire (diagnostic et tests de fuite uniquement)
+ */
+export function _debugStateSizes(): {
+  rooms: number;
+  socketToUser: number;
+  roomToSockets: number;
+  pendingDisconnects: number;
+  pendingDisconnectsByRoom: number;
+  reconnectSecrets: number;
+  roomPasswords: number;
+  roomCreators: number;
+  timerSegments: number;
+} {
+  return {
+    rooms: rooms.size,
+    socketToUser: socketToUser.size,
+    roomToSockets: roomToSockets.size,
+    pendingDisconnects: pendingDisconnects.size,
+    pendingDisconnectsByRoom: pendingDisconnectsByRoom.size,
+    reconnectSecrets: reconnectSecrets.size,
+    roomPasswords: roomPasswords.size,
+    roomCreators: roomCreators.size,
+    timerSegments: timerSegments.size,
+  };
+}
+
 // Lancer le nettoyage périodique des rooms expirées
 const roomCleanupInterval = setInterval(() => {
-  const expired = cleanupExpiredRooms();
-  if (expired.length > 0) {
-    console.log(`[TTL] Cleaned up ${expired.length} expired room(s)`);
+  try {
+    const expired = cleanupExpiredRooms();
+    if (expired.length > 0) {
+      console.log(`[TTL] Cleaned up ${expired.length} expired room(s)`);
+    }
+  } catch (e) {
+    console.error('[TTL] room cleanup failed', e);
   }
 }, CLEANUP_INTERVAL);
 
@@ -1013,8 +1164,8 @@ export function sanitizeRoomForUser(room: Room, recipientUserId: string): Room {
       if (item.id !== activeItemId) return item;
 
       const sanitizedVotes: Record<string, Vote> = {};
-      for (const [oderId, vote] of Object.entries(item.votes)) {
-        sanitizedVotes[oderId] = oderId === recipientUserId
+      for (const [userId, vote] of Object.entries(item.votes)) {
+        sanitizedVotes[userId] = userId === recipientUserId
           ? vote
           : { value: 'hidden', createdAt: vote.createdAt };
       }
