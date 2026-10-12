@@ -29,7 +29,7 @@ RUN git clone --depth 1 --branch "$GIT_BRANCH" "$GIT_REPO" /source
 # -----------------------------------------------------------------------------
 # Stage 2: Dependencies (dev + prod pour le build)
 # -----------------------------------------------------------------------------
-FROM node:24-alpine AS deps
+FROM node:26-alpine AS deps
 
 RUN apk add --no-cache python3 make g++
 
@@ -42,7 +42,7 @@ RUN npm ci
 # -----------------------------------------------------------------------------
 # Stage 3: Production dependencies only
 # -----------------------------------------------------------------------------
-FROM node:24-alpine AS prod-deps
+FROM node:26-alpine AS prod-deps
 
 RUN apk add --no-cache python3 make g++
 
@@ -55,7 +55,7 @@ RUN npm ci --omit=dev
 # -----------------------------------------------------------------------------
 # Stage 4: Builder
 # -----------------------------------------------------------------------------
-FROM node:24-alpine AS builder
+FROM node:26-alpine AS builder
 
 WORKDIR /app
 
@@ -80,7 +80,7 @@ RUN npm run build
 # -----------------------------------------------------------------------------
 # Stage 5: Runner
 # -----------------------------------------------------------------------------
-FROM node:24-alpine AS runner
+FROM node:26-alpine AS runner
 
 WORKDIR /app
 
