@@ -159,6 +159,9 @@ jobs:
         BODY=$(gh api repos/${{ github.repository }}/releases/generate-notes \
           -f tag_name="${{ github.ref_name }}" \
           --jq '.body')
+        # Nom d'image en minuscules : github.repository garde la casse (KLMCorp/...),
+        # Docker exige un nom de depot en minuscules (metadata-action l'abaisse deja pour le push)
+        IMAGE="${REGISTRY}/${IMAGE_NAME,,}"
         # Combine Docker instructions + changelog
         {
           echo "## Docker"
@@ -166,7 +169,7 @@ jobs:
           echo "Image multi-arch (linux/amd64, linux/arm64) :"
           echo ""
           echo '```bash'
-          echo "docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}"
+          echo "docker pull ${IMAGE}:${{ steps.version.outputs.VERSION }}"
           echo '```'
           echo ""
           echo "$BODY"
